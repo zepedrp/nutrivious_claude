@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($pythonPath = \"C:\\\\Users\\\\ZÉ\\\\AppData\\\\Local\\\\Python\\\\pythoncore-3.14-64\\\\python.exe\"; $alembicPath = \"C:\\\\Users\\\\ZÉ\\\\AppData\\\\Local\\\\Python\\\\pythoncore-3.14-64\\\\Scripts\\\\alembic.exe\"; Set-Location \"C:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\"; & $alembicPath init migrations 2>&1)",
+      "PowerShell($f = \"C:\\\\Users\\\\Z0D9A~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Z--NUTRIVIOUS-CALUDE\\\\94bea0e2-43f1-417d-adfe-f412cf1eff23\\\\tasks\\\\bifsm0o71.output\"; $lines = Get-Content $f; $total = $lines.Count; $lines[\\($total - 40\\)..\\($total - 1\\)])",
+      "PowerShell(Get-Process -Id 17348, 2304 -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-WmiObject Win32_Process | Where-Object { $_.ProcessId -in @\\(17348, 2304\\) } | Select-Object ProcessId, Name, ExecutablePath)",
+      "PowerShell(docker exec nutrivious-db-1 psql -U nutrivious -c \"\\\\l\" 2>&1)",
+      "PowerShell(docker exec nutrivious-db-1 psql -U nutrivious -c \"CREATE DATABASE nutrivious_bos;\" 2>&1)",
+      "PowerShell(docker rm nutrivious_bos_db 2>&1)",
+      "PowerShell(docker exec nutrivious-db-1 psql -U nutrivious -d nutrivious_bos -c \"\\\\dt\" 2>&1)",
+      "Bash(python -c ' *)",
+      "Bash(py -3 -c ' *)",
+      "Bash(Remove-Item -Force \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\engine\\\\phase4_constants.py\" -ErrorAction SilentlyContinue)",
+      "Bash(Remove-Item -Force \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\schemas\\\\phase4\\\\__init__.py\" -ErrorAction SilentlyContinue)",
+      "Bash(Remove-Item -Force \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\schemas\\\\phase4\\\\hrv_stream_schema.py\" -ErrorAction SilentlyContinue)",
+      "Bash(Remove-Item -Force \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\schemas\\\\phase4\\\\cgm_stream_schema.py\" -ErrorAction SilentlyContinue)",
+      "Bash(Remove-Item -Force \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\schemas\\\\phase4\\\\sleep_stream_schema.py\" -ErrorAction SilentlyContinue)",
+      "Bash(python3 -c ' *)",
+      "PowerShell(if \\(!\\(Test-Path \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\schemas\\\\phase4\"\\)\\) { New-Item -ItemType Directory -Path \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\schemas\\\\phase4\" -Force })",
+      "Bash(if not *)",
+      "Bash(New-Item -ItemType Directory -Force \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\engine\\\\solvers\")",
+      "Bash(Out-Null)",
+      "Bash(Write-Output \"ok\")",
+      "Bash(Test-Path \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\test_engine_integration.py\")",
+      "Bash(Remove-Item \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\engine\\\\solvers\\\\thermoregulation_fluid_solver.py\" -Force)",
+      "Bash(ls /mnt/c/Users/ZÉ/NUTRIVIOUS_CALUDE/app/engine/)",
+      "Read(//mnt/c/Users/ZÉ/NUTRIVIOUS_CALUDE/app/**)",
+      "Bash(mkdir -p \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\engine\\\\orchestrator\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\Z�\\NUTRIVIOUS_CALUDE\\app\\schemas",
+      "c:\\Users\\ZÉ\\NUTRIVIOUS_CALUDE",
+      "c:\\Users\\Z�\\NUTRIVIOUS_CALUDE",
+      "c:\\Users\\Z�\\NUTRIVIOUS_CALUDE\\app\\engine",
+      "c:\\Users\\Z�\\NUTRIVIOUS_CALUDE\\app\\engine\\solvers",
+      "c:\\Users\\ZÉ\\NUTRIVIOUS_CALUDE\\app\\engine",
+      "c:\\Users\\ZÉ\\.claude\\projects\\c--Users-Z--NUTRIVIOUS-CALUDE\\memory"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"c:\\\\Users\\\\ZÉ\\\\.claude\\\\projects\\\\c--Users-Z--NUTRIVIOUS-CALUDE\\\\memory\\\\\" 2>&1)",
+      "Read(//c/Users/ZÉ/.claude/projects/c--Users-Z--NUTRIVIOUS-CALUDE/**)",
+      "PowerShell($gi = Get-Content \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\models\\\\phase1\\\\gastrointestinal.py\" | Where-Object { $_ -match \":\\\\s+Mapped\\\\[Optional\\\\[float\\\\]\\\\]|:\\\\s+Mapped\\\\[Optional\\\\[int\\\\]\\\\]\" }; $gi.Count)",
+      "PowerShell($h = Get-Content \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\\\\app\\\\models\\\\phase1\\\\hepatic.py\" | Where-Object { $_ -match \":\\\\s+Mapped\\\\[Optional\\\\[float\\\\]\\\\]|:\\\\s+Mapped\\\\[Optional\\\\[int\\\\]\\\\]\" }; $h.Count)",
+      "Bash(dir \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\")",
+      "Bash(pip install *)",
+      "Bash(alembic init *)"
+    ]
+  }
+}

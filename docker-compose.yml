@@ -1,0 +1,16 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: nutrivious_bos_db
+    environment:
+      POSTGRES_USER: nutrivious
+      POSTGRES_PASSWORD: nutrivious
+      POSTGRES_DB: nutrivious_bos
+    ports:
+      - "5432:5432"
+    volumes:
+      - nutrivious_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  nutrivious_pgdata:

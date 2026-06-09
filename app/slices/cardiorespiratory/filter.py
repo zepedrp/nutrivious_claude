@@ -1,13 +1,14 @@
 """
 app/slices/cardiorespiratory/filter.py
 
-L4 State Filter — Cardiorespiratory Slice
-Unscented Kalman Filter for the 6-state cardiorespiratory performance system.
+L4 State Filter -- Cardiorespiratory Slice
+Unscented Kalman Filter for the 8-state cardiorespiratory performance system.
 
-Architecture (HLD §4.3 — L4: State Estimation)
-────────────────────────────────────────────────
-State x ∈ ℝ⁶:
-    [V_O2, Heart_Rate, Stroke_Volume, W_prime_bal, Resp_Fatigue, Autonomic_Tone]
+Architecture (HLD ss4.3 -- L4: State Estimation)
+─────────────────────────────────────────────────
+State x in R^8:
+    [V_O2, Heart_Rate, Stroke_Volume, W_fast, W_slow,
+     Resp_Fatigue, Autonomic_Tone, RMSSD_load_7d]
 
 Observation y ∈ ℝ³:
     [HR_obs_bpm, VO2_obs_mLkgmin, RMSSD_obs_ms]
@@ -21,29 +22,25 @@ Control u = (power_watts, hub_T_core, hub_pv_drop_pct)
 
 Physical clamps (MANDATORY post-update)
 ────────────────────────────────────────
-Applied immediately after every UKF measurement update to prevent the linear
-Kalman gain from driving states into physiologically impossible territory:
-    V_O2          ≥ 0 mL/kg/min   (oxygen consumption never negative)
-    Heart_Rate    ≥ HR_floor       (absolute bradycardia sentinel, default 30 bpm)
-    Stroke_Volume ≥ 0.020 L        (minimum viable cardiac output sentinel)
-    W_prime_bal   ≥ 0 kJ           (battery cannot be < 0 by definition)
-    Resp_Fatigue  ∈ [0, 1]         (bounded fraction)
-    Autonomic_Tone ∈ [0, 1]        (bounded fraction)
-These clamps use jnp.maximum / jnp.clip — no Python control flow.
+Applied immediately after every UKF measurement update:
+    V_O2           >= 0 mL/kg/min
+    Heart_Rate     >= HR_floor    (30 bpm sentinel)
+    Stroke_Volume  >= 0.020 L
+    W_fast         >= 0 kJ
+    W_slow         >= 0 kJ
+    Resp_Fatigue   in [0, 1]
+    Autonomic_Tone in [0, 1]
+    RMSSD_load_7d  >= 0 ms
 
 Multi-signal observation (quality-aware)
 ─────────────────────────────────────────
-HR is dense (wearable heartbeat); VO2 and RMSSD are sparse (metabolic cart,
-morning-only HRV). Missing observations (NaN) inflate the corresponding
-R diagonal entry by 1e8, making the innovation zero — a predict-only step
-for that channel. This preserves state coherence without silent zero-filling.
+HR is dense; VO2 and RMSSD are sparse. NaN obs -> R x 1e8 (predict-only).
 
-UKF parametrisation (Merwe & Wan 2000) — N = STATE_DIM = 6
-────────────────────────────────────────────────────────────
-    α = 1e-3  (tight sigma-point spread; good for near-linear physiology)
-    β = 2.0   (optimal for Gaussian distributions)
-    κ = 0.0
-    λ = α²(n+κ) − n = 1e-6 × 6 − 6 ≈ −5.999994
+UKF parametrisation (Merwe & Wan 2000) -- N = STATE_DIM = 8
+─────────────────────────────────────────────────────────────
+    alpha = 0.10  float32-safe for n=8 (Wm[0] = -99)
+    beta  = 2.0
+    kappa = 0.0
 
 Fail-Loud contract
 ──────────────────
@@ -84,7 +81,9 @@ from app.slices.cardiorespiratory.ode import (
     P0_CARDIO_DEFAULT,
     STATE_DIM,
     OBS_DIM,
-    IDX_VO2, IDX_HR, IDX_SV, IDX_WPRIME, IDX_RF, IDX_AT,
+    IDX_VO2, IDX_HR, IDX_SV,
+    IDX_WFAST, IDX_WSLOW,
+    IDX_RF, IDX_AT, IDX_RMSSD7D,
     cardiorespiratory_slice_ode,
 )
 from app.slices.cardiorespiratory.observation import (
@@ -112,12 +111,12 @@ from app.engine.assimilation.ukf_filter import (
 logger = logging.getLogger(__name__)
 
 
-# ── UKF Merwe-Wan sigma-point parameters (n = STATE_DIM = 6) ─────────────────
+# ── UKF Merwe-Wan sigma-point parameters (n = STATE_DIM = 8) ─────────────────
 #
-# alpha=0.10: float32-safe for n=6 (Wm[0] = -99.0; no catastrophic cancellation).
+# alpha=0.10: float32-safe for n=8 (Wm[0] = -99.0; no catastrophic cancellation).
 # See ukf_filter.py module docstring for the full float32 safety analysis.
 
-_N:     int   = STATE_DIM   # 6
+_N:     int   = STATE_DIM   # 8
 _ALPHA: float = 0.10
 _BETA:  float = 2.0
 _KAPPA: float = 0.0
@@ -128,26 +127,28 @@ _WM, _WC, _LAM = ukf_weights(_N, _ALPHA, _BETA, _KAPPA)
 # clamping.  Values chosen so the floor is well below sensor noise (R diagonal)
 # but prevents the filter from claiming zero uncertainty on any state.
 _VAR_FLOOR: jax.Array = jnp.array([
-    1.0e-2,   # VO2   (0.1 mL/kg/min)^2
-    2.5e-1,   # HR    (0.5 bpm)^2
-    1.0e-6,   # SV    (0.001 L)^2
-    1.0e-4,   # W'    (0.01 kJ)^2
-    1.0e-6,   # RF    (0.001 adim)^2
-    1.0e-6,   # AT    (0.001 adim)^2
+    1.0e-2,   # VO2       (0.1 mL/kg/min)^2
+    2.5e-1,   # HR        (0.5 bpm)^2
+    1.0e-6,   # SV        (0.001 L)^2
+    1.0e-4,   # W_fast    (0.01 kJ)^2
+    1.0e-4,   # W_slow    (0.01 kJ)^2
+    1.0e-6,   # RF        (0.001 adim)^2
+    1.0e-6,   # AT        (0.001 adim)^2
+    1.0e-2,   # RMSSD_7d  (0.1 ms)^2
 ], dtype=jnp.float32)
 
 
-# ── Process noise Q (diagonal, Δt = 1 min) ───────────────────────────────────
-# Each entry reflects expected state variability from unmodelled disturbances
-# over a 1-minute integration window.
+# ── Process noise Q (diagonal, dt = 1 min) ───────────────────────────────────
 
 _Q_DIAG: jax.Array = jnp.array([
-    4.0,     # V_O2   [(mL/kg/min)²] — VO2 kinetic variability over 1 min
-    9.0,     # HR     [bpm²]         — HR noise + autonomic fluctuation
-    2.5e-4,  # SV     [L²]           — SV variability (σ ≈ 0.016 L)
-    1.0,     # W'_bal [kJ²]          — W' kinetic variability (σ ≈ 1 kJ/min)
-    1.0e-3,  # RF     [adim²]        — respiratory fatigue variability
-    1.0e-3,  # AT     [adim²]        — autonomic tone fluctuation (σ ≈ 0.032)
+    4.0,     # V_O2      [(mL/kg/min)^2]  VO2 kinetic variability
+    9.0,     # HR        [bpm^2]          HR noise + autonomic fluctuation
+    2.5e-4,  # SV        [L^2]            SV variability (sigma ~0.016 L)
+    0.25,    # W_fast    [kJ^2]           fast pool variability (sigma ~0.5 kJ)
+    0.25,    # W_slow    [kJ^2]           slow pool variability
+    1.0e-3,  # RF        [adim^2]         respiratory fatigue variability
+    1.0e-3,  # AT        [adim^2]         autonomic tone fluctuation
+    1.0e-4,  # RMSSD_7d  [ms^2]           very slow EWMA (tau=7 days)
 ], dtype=jnp.float32)
 
 Q_DEFAULT: jax.Array = jnp.diag(_Q_DIAG)
@@ -308,48 +309,46 @@ def _apply_physical_clamps(
     params: CardioSliceParams,
 ) -> tuple[jax.Array, jax.Array]:
     """
-    Gaussian-coherent physical clamping via truncated-normal moment matching
-    (Simon 2010) followed by Simon variance floor enforcement.
+    Gaussian-coherent physical clamping (Simon 2010 truncated-normal).
 
     Step 1 -- truncated-normal moment matching per constrained dimension:
-        V_O2          >= 0             mL/kg/min
-        Heart_Rate    >= HR_floor      bpm
-        Stroke_Volume >= 0.020         L
-        W_prime_bal   >= 0             kJ
-        Resp_Fatigue  in [0, 1]        adim
-        Autonomic_Tone in [0, 1]       adim
+        V_O2          >= 0          mL/kg/min
+        Heart_Rate    >= HR_floor   bpm
+        Stroke_Volume >= 0.020      L
+        W_fast        >= 0          kJ
+        W_slow        >= 0          kJ
+        Resp_Fatigue  in [0, 1]     adim
+        Autonomic_Tone in [0, 1]    adim
+        RMSSD_load_7d >= 0          ms
 
-    Step 2 -- variance floor (Simon 2010 Section 5.4):
-        diag(cov) >= _VAR_FLOOR  (prevents overconfidence after tight clamping)
-
-    Step 3 -- nearest_psd repair:
-        Ensures the final cov is strictly PSD for the next sigma-point generation.
-
-    All ops via jnp -- JIT-compatible, no Python control flow on array values.
+    Step 2 -- variance floor (Simon 2010 Section 5.4).
+    Step 3 -- nearest_psd repair (Higham 1988).
     """
-    # Step 1: truncated-normal moment matching
-    m, v = lower_clamp_moments(mean[IDX_VO2],    cov[IDX_VO2, IDX_VO2],       0.0)
+    m, v = lower_clamp_moments(mean[IDX_VO2],     cov[IDX_VO2,   IDX_VO2],   0.0)
     mean, cov = clamp_dim(mean, cov, IDX_VO2, m, v)
 
-    m, v = lower_clamp_moments(mean[IDX_HR],     cov[IDX_HR, IDX_HR],         float(params.HR_floor))
+    m, v = lower_clamp_moments(mean[IDX_HR],      cov[IDX_HR,    IDX_HR],    float(params.HR_floor))
     mean, cov = clamp_dim(mean, cov, IDX_HR, m, v)
 
-    m, v = lower_clamp_moments(mean[IDX_SV],     cov[IDX_SV, IDX_SV],         0.020)
+    m, v = lower_clamp_moments(mean[IDX_SV],      cov[IDX_SV,    IDX_SV],    0.020)
     mean, cov = clamp_dim(mean, cov, IDX_SV, m, v)
 
-    m, v = lower_clamp_moments(mean[IDX_WPRIME], cov[IDX_WPRIME, IDX_WPRIME], 0.0)
-    mean, cov = clamp_dim(mean, cov, IDX_WPRIME, m, v)
+    m, v = lower_clamp_moments(mean[IDX_WFAST],   cov[IDX_WFAST, IDX_WFAST], 0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_WFAST, m, v)
 
-    m, v = range_clamp_moments(mean[IDX_RF],     cov[IDX_RF, IDX_RF],         0.0, 1.0)
+    m, v = lower_clamp_moments(mean[IDX_WSLOW],   cov[IDX_WSLOW, IDX_WSLOW], 0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_WSLOW, m, v)
+
+    m, v = range_clamp_moments(mean[IDX_RF],      cov[IDX_RF,    IDX_RF],    0.0, 1.0)
     mean, cov = clamp_dim(mean, cov, IDX_RF, m, v)
 
-    m, v = range_clamp_moments(mean[IDX_AT],     cov[IDX_AT, IDX_AT],         0.0, 1.0)
+    m, v = range_clamp_moments(mean[IDX_AT],      cov[IDX_AT,    IDX_AT],    0.0, 1.0)
     mean, cov = clamp_dim(mean, cov, IDX_AT, m, v)
 
-    # Step 2: variance floor
-    cov = variance_floor(cov, _VAR_FLOOR)
+    m, v = lower_clamp_moments(mean[IDX_RMSSD7D], cov[IDX_RMSSD7D, IDX_RMSSD7D], 0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_RMSSD7D, m, v)
 
-    # Step 3: nearest PSD repair (absorbs any residual float32 drift)
+    cov = variance_floor(cov, _VAR_FLOOR)
     cov = nearest_psd(cov)
 
     return mean, cov
@@ -359,10 +358,10 @@ def _apply_physical_clamps(
 
 class CardioStateFilter:
     """
-    L4 Unscented Kalman Filter for the 6-state cardiorespiratory performance system.
+    L4 Unscented Kalman Filter for the 8-state cardiorespiratory performance system.
 
-    Infers V_O2, HR, SV, W'_bal, Resp_Fatigue, and Autonomic_Tone from
-    the wearable HR signal (dense) plus sparse VO2 / RMSSD measurements.
+    Infers V_O2, HR, SV, W_fast, W_slow, Resp_Fatigue, Autonomic_Tone, RMSSD_load_7d
+    from the wearable HR signal (dense) plus sparse VO2 / RMSSD measurements.
 
     Typical usage (single 1-min HR update)
     ──────────────────────────────────────

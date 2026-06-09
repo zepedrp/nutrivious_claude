@@ -21,7 +21,9 @@ from app.slices.cardiorespiratory.ode import (
     CardioSliceParams,
     X0_CARDIO_DEFAULT,
     P0_CARDIO_DEFAULT,
-    IDX_VO2, IDX_HR, IDX_SV, IDX_WPRIME, IDX_RF, IDX_AT,
+    IDX_VO2, IDX_HR, IDX_SV,
+    IDX_WFAST, IDX_WSLOW,
+    IDX_RF, IDX_AT, IDX_RMSSD7D,
     STATE_DIM, OBS_DIM,
 )
 from app.slices.cardiorespiratory.observation import (
@@ -48,7 +50,9 @@ __all__ = [
     "CardioSliceParams",
     "X0_CARDIO_DEFAULT",
     "P0_CARDIO_DEFAULT",
-    "IDX_VO2", "IDX_HR", "IDX_SV", "IDX_WPRIME", "IDX_RF", "IDX_AT",
+    "IDX_VO2", "IDX_HR", "IDX_SV",
+    "IDX_WFAST", "IDX_WSLOW",
+    "IDX_RF", "IDX_AT", "IDX_RMSSD7D",
     "STATE_DIM", "OBS_DIM",
     "h_cardio",
     "h_cardio_sigma",

@@ -67,6 +67,7 @@ References
 """
 from __future__ import annotations
 
+import functools
 import logging
 from typing import NamedTuple
 
@@ -185,11 +186,12 @@ def simulate_hr_trajectory(
 # ── NumPyro NLME model ────────────────────────────────────────────────────────
 
 def cardio_nlme_model(
-    session_data: dict,
-    observations: jax.Array,   # (N_obs,) — HR readings [bpm]
-    subject_ids:  jax.Array,   # (N_obs,) int — maps obs to subject
-    obs_step_ids: jax.Array,   # (N_obs,) int — maps obs to time step
-    n_subjects:   int,
+    session_data:  dict,
+    observations:  jax.Array,   # (N_obs,) — HR readings [bpm]
+    subject_ids:   jax.Array,   # (N_obs,) int — maps obs to subject
+    obs_step_ids:  jax.Array,   # (N_obs,) int — maps obs to time step
+    n_subjects:    int,
+    frozen_params: tuple = (),  # param names to pin at population prior mean
 ) -> None:
     """
     NumPyro NLME model for cardiorespiratory kinetics — non-centred parametrisation.
@@ -201,28 +203,34 @@ def cardio_nlme_model(
 
     Parameters
     ----------
-    session_data  : dict — see above
-    observations  : (N_obs,) — HR readings [bpm]; NaN accepted (masked below)
-    subject_ids   : (N_obs,) int — subject index for each observation
-    obs_step_ids  : (N_obs,) int — time-step index (0..T-1) for each observation
-    n_subjects    : int — fleet size
+    session_data   : dict — see above
+    observations   : (N_obs,) — HR readings [bpm]; NaN accepted (masked below)
+    subject_ids    : (N_obs,) int — subject index for each observation
+    obs_step_ids   : (N_obs,) int — time-step index (0..T-1) for each observation
+    n_subjects     : int — fleet size
+    frozen_params  : tuple[str] — parameter names to freeze at their population
+                     prior mean via numpyro.deterministic (Pilar 2: OED freezing).
+                     Frozen parameters are not sampled and have zero between-subject
+                     variance. Useful after OED identifies unidentifiable directions.
+                     Valid values: any subset of THETA_NAMES.
 
-    Model
-    ─────
-    θ_pop_log   ~ N(log_prior_mean, log_prior_sd)         [D_THETA pop means]
-    scale_eta   ~ HalfNormal(0.25)^D_THETA               [between-subject SDs]
-    Ω_chol      ~ LKJCholesky(D_THETA, concentration=2.0) [correlation]
-    L_Ω         = diag(scale_eta) @ Ω_chol
-    σ_obs       ~ HalfNormal(5.0)                         [HR residual SD, bpm]
+    Model (when no params are frozen; D_active == D_THETA)
+    ──────────────────────────────────────────────────────
+    theta_pop_log ~ N(log_prior_mean, log_prior_sd)         [D_active pop means]
+    scale_eta     ~ HalfNormal(0.25)^D_active              [between-subject SDs]
+    Omega_chol    ~ LKJCholesky(D_active, conc=2.0)        [correlation; omitted D=1]
+    L_Omega       = diag(scale_eta) @ Omega_chol
+    sigma_obs     ~ HalfNormal(5.0)                         [HR residual SD, bpm]
 
     Per subject i (non-centred Matt trick):
-        η_raw_i ~ N(0, I_D)
-        η_i      = η_raw_i @ L_Ω.T
-        θ_i      = exp(θ_pop_log + η_i)
-        HR_traj  = simulate_hr_trajectory(log(θ_i), x0_i, power_rates_i)
+        eta_raw_i  ~ N(0, I_{D_active})
+        eta_i      = eta_raw_i @ L_Omega.T
+        log_theta_i[active] = theta_pop_log + eta_i
+        log_theta_i[frozen] = log_prior_mean[frozen]       (deterministic)
+        HR_traj    = simulate_hr_trajectory(log_theta_i, x0_i, power_rates_i)
 
     Likelihood:
-        y_t ~ N(HR_traj_i[t], σ_obs)
+        y_t ~ N(HR_traj_i[t], sigma_obs)
     """
     if not _NUMPYRO_OK:
         raise RuntimeError(
@@ -230,34 +238,78 @@ def cardio_nlme_model(
             "Install: pip install numpyro"
         )
 
-    # ── Population fixed effects ──────────────────────────────────────────
-    theta_pop_log = numpyro.sample(
-        "theta_pop_log",
-        dist.Normal(_LOG_PRIOR_MEAN, _LOG_PRIOR_SD),
-    )   # (D_THETA,)
+    frozen_set  = set(frozen_params)
+    active_idx  = [i for i, n in enumerate(THETA_NAMES) if n not in frozen_set]
+    frozen_idx  = [i for i, n in enumerate(THETA_NAMES) if n in frozen_set]
+    D_active    = len(active_idx)
 
-    # ── Between-subject covariance (LKJ + scale) ──────────────────────────
-    scale_eta = numpyro.sample(
-        "scale_eta",
-        dist.HalfNormal(0.25).expand([D_THETA]),
-    )   # (D_THETA,)
-    Omega_chol = numpyro.sample(
-        "Omega_chol",
-        dist.LKJCholesky(D_THETA, concentration=2.0),
-    )   # (D_THETA, D_THETA)
-    L_eta = jnp.diag(scale_eta) @ Omega_chol   # (D_THETA, D_THETA)
+    # ── Population fixed effects (active subset) ──────────────────────────
+    if D_active == D_THETA:
+        # Original behaviour: sample full D_THETA vector under one site
+        theta_pop_log_active = numpyro.sample(
+            "theta_pop_log",
+            dist.Normal(_LOG_PRIOR_MEAN, _LOG_PRIOR_SD),
+        )   # (D_THETA,)
+        theta_pop_log = theta_pop_log_active
+    elif D_active > 0:
+        active_arr = jnp.array(active_idx, dtype=jnp.int32)
+        theta_pop_log_active = numpyro.sample(
+            "theta_pop_log",
+            dist.Normal(_LOG_PRIOR_MEAN[active_arr], _LOG_PRIOR_SD[active_arr]),
+        )   # (D_active,)
+        theta_pop_log = _LOG_PRIOR_MEAN.at[active_arr].set(theta_pop_log_active)
+        for i in frozen_idx:
+            numpyro.deterministic(
+                f"frozen_{THETA_NAMES[i]}",
+                jnp.float32(_LOG_PRIOR_MEAN[i]),
+            )
+    else:
+        # All params frozen: use prior means directly
+        theta_pop_log = _LOG_PRIOR_MEAN
+        for i in frozen_idx:
+            numpyro.deterministic(
+                f"frozen_{THETA_NAMES[i]}",
+                jnp.float32(_LOG_PRIOR_MEAN[i]),
+            )
+
+    # ── Between-subject covariance (LKJ + scale; only over active params) ─
+    if D_active > 1:
+        scale_eta = numpyro.sample(
+            "scale_eta",
+            dist.HalfNormal(0.25).expand([D_active]),
+        )   # (D_active,)
+        Omega_chol = numpyro.sample(
+            "Omega_chol",
+            dist.LKJCholesky(D_active, concentration=2.0),
+        )   # (D_active, D_active)
+        L_eta = jnp.diag(scale_eta) @ Omega_chol   # (D_active, D_active)
+    elif D_active == 1:
+        scale_eta = numpyro.sample(
+            "scale_eta",
+            dist.HalfNormal(jnp.array([0.25])),
+        )   # (1,)
+        L_eta = scale_eta.reshape(1, 1)
+        # No Omega_chol site for D=1 (LKJCholesky(1) is always identity)
 
     # ── Residual observation noise ─────────────────────────────────────────
     sigma_obs = numpyro.sample("sigma_obs", dist.HalfNormal(5.0))  # bpm
 
     # ── Per-subject random effects (non-centred) ──────────────────────────
-    with numpyro.plate("subjects", n_subjects):
-        eta_raw = numpyro.sample(
-            "eta_raw",
-            dist.Normal(0.0, 1.0).expand([D_THETA]).to_event(1),
-        )   # (n_subjects, D_THETA)
-        eta_i       = eta_raw @ L_eta.T                 # (n_subjects, D_THETA)
-        log_theta_i = theta_pop_log + eta_i             # (n_subjects, D_THETA)
+    if D_active > 0:
+        active_arr = jnp.array(active_idx, dtype=jnp.int32)
+        with numpyro.plate("subjects", n_subjects):
+            eta_raw = numpyro.sample(
+                "eta_raw",
+                dist.Normal(0.0, 1.0).expand([D_active]).to_event(1),
+            )   # (n_subjects, D_active)
+        eta_active  = eta_raw @ L_eta.T   # (n_subjects, D_active)
+        # Scatter active effects into full D_THETA space (frozen slots stay 0)
+        eta_full    = jnp.zeros((n_subjects, D_THETA))
+        eta_full    = eta_full.at[:, active_arr].set(eta_active)
+    else:
+        eta_full = jnp.zeros((n_subjects, D_THETA))
+
+    log_theta_i = theta_pop_log[None, :] + eta_full   # (n_subjects, D_THETA)
 
     # ── Forward simulation for every subject (vmapped) ────────────────────
     HR_trajs = jax.vmap(
@@ -343,6 +395,7 @@ class CardioNLME:
         subject_ids:   jax.Array,
         obs_step_ids:  jax.Array,
         n_subjects:    int,
+        frozen_params: tuple = (),
         n_steps:       int   = 20_000,
         lr:            float = 1e-3,
         rank:          int   = 4,
@@ -352,19 +405,24 @@ class CardioNLME:
         Fit the cardio NLME model using Stochastic Variational Inference.
 
         Guide: AutoLowRankMultivariateNormal (rank-4 approximation to the
-        joint posterior over θ_pop_log, scale_eta, Ω_chol, η_raw, σ_obs).
+        joint posterior over theta_pop_log, scale_eta, Omega_chol, eta_raw, sigma_obs).
 
         Parameters
         ----------
-        session_data  : dict — {"power_rates": (N, T), "x0s": (N, STATE_DIM)}
-        observations  : (N_obs,) — HR readings [bpm]; NaN for missing
-        subject_ids   : (N_obs,) int
-        obs_step_ids  : (N_obs,) int
-        n_subjects    : int
-        n_steps       : int — SVI iterations (default 20k)
-        lr            : float — Adam learning rate
-        rank          : int — guide covariance rank
-        seed          : int — JAX PRNGKey seed
+        session_data   : dict — {"power_rates": (N, T), "x0s": (N, STATE_DIM)}
+        observations   : (N_obs,) — HR readings [bpm]; NaN for missing
+        subject_ids    : (N_obs,) int
+        obs_step_ids   : (N_obs,) int
+        n_subjects     : int
+        frozen_params  : tuple[str] — parameter names to pin at their population
+                         prior mean (Pilar 2: OED parameter freezing). Frozen params
+                         are excluded from the variational posterior, saving SVI
+                         cost and preventing equifinality hallucinations.
+                         Valid values: any subset of THETA_NAMES.
+        n_steps        : int — SVI iterations (default 20k)
+        lr             : float — Adam learning rate
+        rank           : int — guide covariance rank
+        seed           : int — JAX PRNGKey seed
 
         Returns
         -------
@@ -378,9 +436,11 @@ class CardioNLME:
         sids = jnp.asarray(subject_ids,  dtype=jnp.int32)
         tids = jnp.asarray(obs_step_ids, dtype=jnp.int32)
 
-        guide     = AutoLowRankMultivariateNormal(cardio_nlme_model, rank=rank)
+        # Bake frozen_params into a partial so the guide sees the reduced model
+        model_fn  = functools.partial(cardio_nlme_model, frozen_params=tuple(frozen_params))
+        guide     = AutoLowRankMultivariateNormal(model_fn, rank=rank)
         optimizer = numpyro.optim.optax_to_numpyro(optax.adam(lr))
-        svi       = SVI(cardio_nlme_model, guide, optimizer, loss=Trace_ELBO())
+        svi       = SVI(model_fn, guide, optimizer, loss=Trace_ELBO())
 
         rng_key   = jax.random.PRNGKey(seed)
         svi_state = svi.init(rng_key, session_data, obs, sids, tids, n_subjects)
@@ -388,7 +448,7 @@ class CardioNLME:
         elbo_vals: list[float] = []
         for step in range(n_steps):
             svi_state, loss = svi.update(
-                svi_state, session_data, obs, sids, tids, n_subjects
+                svi_state, session_data, obs, sids, tids, n_subjects,
             )
             elbo_vals.append(-float(loss))
             if jnp.isnan(jnp.float32(loss)):

@@ -41,6 +41,7 @@ References
 """
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from typing import NamedTuple
@@ -211,20 +212,43 @@ def _predict_one_subject(
 # ── NumPyro model ─────────────────────────────────────────────────────────────
 
 def build_neuro_nlme_model(
-    n_hours: int,
-    priors: NeuroNLMEPriors = DEFAULT_NLME_PRIORS,
-    obs_params: NeuroObsParams = DEFAULT_OBS_PARAMS,
+    n_hours:       int,
+    priors:        NeuroNLMEPriors = DEFAULT_NLME_PRIORS,
+    obs_params:    NeuroObsParams  = DEFAULT_OBS_PARAMS,
+    frozen_params: tuple           = (),
 ):
     """
-    Factory returning a NumPyro model for the SAM × HPA × Somatotropic NLME.
+    Factory returning a NumPyro model for the SAM x HPA x Somatotropic NLME.
 
-    model(y_obs, subject_idx, x0s)
-      y_obs       : (N_total_obs, OBS_DIM=4)
-      subject_idx : (N_total_obs,) int
-      x0s         : (N_subjects, STATE_DIM=9)
+    Parameters
+    ----------
+    n_hours       : int -- number of 1-hour integration steps.
+    priors        : NeuroNLMEPriors -- log-space population hyperparameters.
+    obs_params    : NeuroObsParams -- observation noise parameters.
+    frozen_params : tuple[str] -- parameter names to pin at population prior mean
+                   (Pilar 2: OED parameter freezing). Valid values: any subset of
+                   PARAM_NAMES = ("GC_sensitivity", "IGF1_conv_rate",
+                                  "Metabolic_Flexibility_Threshold").
+
+    The model's eta_raw[i] = 0 for frozen parameters, which fixes:
+        theta_i = exp(log_mean + log_sd * 0) = exp(log_mean) = population mean.
+    This pins the frozen parameter at its prior mean with zero between-subject
+    variance, equivalent to numpyro.deterministic in the non-centred basis.
+
+    Returns
+    -------
+    model : callable (y_obs, subject_idx, x0s) -> None
+        y_obs       : (N_total_obs, OBS_DIM=4)
+        subject_idx : (N_total_obs,) int
+        x0s         : (N_subjects, STATE_DIM=9)
     """
     if not _NUMPYRO_OK:
         raise RuntimeError("numpyro required. pip install numpyro")
+
+    frozen_set = set(frozen_params)
+    active_idx = [i for i, n in enumerate(PARAM_NAMES) if n not in frozen_set]
+    frozen_idx = [i for i, n in enumerate(PARAM_NAMES) if n in frozen_set]
+    D_active   = len(active_idx)
 
     sigma_y = jnp.array([
         obs_params.sigma_Epi,
@@ -236,18 +260,42 @@ def build_neuro_nlme_model(
     def model(y_obs, subject_idx, x0s):
         N_subjects = x0s.shape[0]
 
-        Omega_chol = numpyro.sample(
-            "Omega_chol",
-            dist.LKJCholesky(D, concentration=2.0),
-        )
+        # Deterministic markers for frozen parameters (for trace inspection)
+        for i in frozen_idx:
+            numpyro.deterministic(f"frozen_{PARAM_NAMES[i]}", jnp.float32(0.0))
 
-        with numpyro.plate("subjects", N_subjects):
-            eta_raw = numpyro.sample(
-                "eta_raw",
-                dist.Normal(jnp.zeros(D), jnp.ones(D)),
-            )
+        # Between-subject correlation (active params only)
+        if D_active > 1:
+            Omega_chol_active = numpyro.sample(
+                "Omega_chol",
+                dist.LKJCholesky(D_active, concentration=2.0),
+            )   # (D_active, D_active)
+        # D_active == 1: LKJCholesky(1) is always identity -- skip sampling
+        # D_active == 0: no correlation needed
 
-        eta_i = eta_raw @ Omega_chol.T   # (N_subjects, D)
+        # Subject random effects (active params only)
+        if D_active > 0:
+            active_arr = jnp.array(active_idx, dtype=jnp.int32)
+            with numpyro.plate("subjects", N_subjects):
+                eta_raw_active = numpyro.sample(
+                    "eta_raw",
+                    dist.Normal(
+                        jnp.zeros(D_active, dtype=jnp.float32),
+                        jnp.ones(D_active,  dtype=jnp.float32),
+                    ),
+                )   # (N_subjects, D_active)
+
+            if D_active > 1:
+                eta_active = eta_raw_active @ Omega_chol_active.T  # (N_subjects, D_active)
+            else:
+                eta_active = eta_raw_active   # (N_subjects, 1), no rotation
+
+            # Scatter into full D=3 space; frozen slots remain 0 -> prior mean
+            eta_i = jnp.zeros((N_subjects, D))
+            eta_i = eta_i.at[:, active_arr].set(eta_active)
+        else:
+            # All params frozen: everyone at population prior mean
+            eta_i = jnp.zeros((N_subjects, D))
 
         def _pred_s(args):
             eta_s, x0_s = args
@@ -276,23 +324,33 @@ class NeuroNLMEResult(NamedTuple):
 
 
 def fit_neuro_nlme(
-    y_obs: jnp.ndarray,
-    subject_idx: jnp.ndarray,
-    x0s: jnp.ndarray,
-    n_hours: int,
-    priors: NeuroNLMEPriors = DEFAULT_NLME_PRIORS,
-    obs_params: NeuroObsParams = DEFAULT_OBS_PARAMS,
-    n_steps: int = 20_000,
-    lr: float = 5e-4,
-    seed: int = 42,
+    y_obs:         jnp.ndarray,
+    subject_idx:   jnp.ndarray,
+    x0s:           jnp.ndarray,
+    n_hours:       int,
+    priors:        NeuroNLMEPriors = DEFAULT_NLME_PRIORS,
+    obs_params:    NeuroObsParams  = DEFAULT_OBS_PARAMS,
+    frozen_params: tuple           = (),
+    n_steps:       int             = 20_000,
+    lr:            float           = 5e-4,
+    seed:          int             = 42,
 ) -> NeuroNLMEResult:
-    """Fit the SAM × HPA × Somatotropic NLME via SVI. Fail-Loud on NaN ELBO."""
+    """
+    Fit the SAM x HPA x Somatotropic NLME via SVI. Fail-Loud on NaN ELBO.
+
+    Parameters
+    ----------
+    frozen_params : tuple[str] -- parameter names to pin at population prior mean.
+                   Valid values: any subset of PARAM_NAMES.
+                   Frozen parameters save SVI cost and prevent equifinality
+                   when the data does not constrain those directions.
+    """
     if not _NUMPYRO_OK:
         raise RuntimeError("numpyro required.")
     if not _OPTAX_OK:
         raise RuntimeError("optax required.")
 
-    model = build_neuro_nlme_model(n_hours, priors, obs_params)
+    model = build_neuro_nlme_model(n_hours, priors, obs_params, frozen_params=tuple(frozen_params))
     guide = AutoLowRankMultivariateNormal(model, rank=3)
     optim = numpyro.optim.optax_to_numpyro(optax.adam(lr))
     svi   = SVI(model, guide, optim, loss=Trace_ELBO())

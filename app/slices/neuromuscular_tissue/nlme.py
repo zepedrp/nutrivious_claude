@@ -51,6 +51,7 @@ References
 """
 from __future__ import annotations
 
+import functools
 import logging
 from typing import NamedTuple
 
@@ -155,20 +156,30 @@ def _forward_simulate_v4(
 
 # -- NumPyro NLME model --------------------------------------------------------
 
+_LOG_MEAN_FULL = jnp.array([_LOG_MEAN_P_TH_2, _LOG_MEAN_K_SERCA], dtype=jnp.float32)
+_LOG_SD_FULL   = jnp.array([_LOG_SD_P_TH_2,   _LOG_SD_K_SERCA],   dtype=jnp.float32)
+
+
 def nm_v4_nlme_model(
     observations:  "jax.Array | None",   # (N_total, OBS_DIM) or None
     controls_list: jax.Array,            # (N_subjects, T, CTRL_DIM)
     subject_ids:   jax.Array,            # (N_total,) int
     obs_idx:       jax.Array,            # (N_total,) int
     n_subjects:    int,
+    frozen_params: tuple = (),           # param names to pin at population prior mean
 ) -> None:
     """
     NumPyro hierarchical NLME model for NM V4.0 personalisation.
 
     Non-centred (Matt trick):
-      eta_raw_i ~ N(0, I_D)
-      eta_i     = L_Omega * (scale_eta * eta_raw_i)
-      theta_i   = theta_pop * exp(eta_i)
+      eta_raw_i  ~ N(0, I_{D_active})
+      eta_i      = L_Omega * (scale_eta * eta_raw_i)
+      theta_i[active] = theta_pop * exp(eta_i)
+      theta_i[frozen] = exp(log_prior_mean[frozen])   [deterministic, no sampling]
+
+    frozen_params : tuple[str] -- subset of PARAM_NAMES to pin at population mean.
+      Frozen parameters are excluded from the variational posterior, saving SVI
+      cost and preventing equifinality in under-observed sessions.
 
     Likelihood:
       y_obs ~ Normal(h_nm_v4(ODE(theta_i, controls_i)[t], obs_params), sigma_obs)
@@ -179,47 +190,84 @@ def nm_v4_nlme_model(
             "Install: pip install numpyro>=0.15"
         )
 
-    # -- Population-level log parameters --------------------------------------
-    theta_pop_log = numpyro.sample(
-        "theta_pop_log",
-        dist.Normal(
-            jnp.array([_LOG_MEAN_P_TH_2, _LOG_MEAN_K_SERCA], dtype=jnp.float32),
-            jnp.array([_LOG_SD_P_TH_2,   _LOG_SD_K_SERCA],   dtype=jnp.float32),
-        ),
-    )   # (D,)
+    frozen_set = set(frozen_params)
+    active_idx = [i for i, n in enumerate(PARAM_NAMES) if n not in frozen_set]
+    frozen_idx = [i for i, n in enumerate(PARAM_NAMES) if n in frozen_set]
+    D_active   = len(active_idx)
 
-    # -- Between-subject covariance (LKJCholesky; concentration=2.0) ----------
-    Omega_chol = numpyro.sample(
-        "Omega_chol",
-        dist.LKJCholesky(D, concentration=2.0),
-    )   # (D, D)
+    # -- Population-level log parameters (active subset) ----------------------
+    if D_active == D:
+        theta_pop_log_active = numpyro.sample(
+            "theta_pop_log",
+            dist.Normal(_LOG_MEAN_FULL, _LOG_SD_FULL),
+        )   # (D,)
+        theta_pop_log = theta_pop_log_active
+    elif D_active > 0:
+        active_arr = jnp.array(active_idx, dtype=jnp.int32)
+        theta_pop_log_active = numpyro.sample(
+            "theta_pop_log",
+            dist.Normal(_LOG_MEAN_FULL[active_arr], _LOG_SD_FULL[active_arr]),
+        )   # (D_active,)
+        theta_pop_log = _LOG_MEAN_FULL.at[active_arr].set(theta_pop_log_active)
+        for i in frozen_idx:
+            numpyro.deterministic(
+                f"frozen_{PARAM_NAMES[i]}",
+                jnp.float32(_LOG_MEAN_FULL[i]),
+            )
+    else:
+        theta_pop_log = _LOG_MEAN_FULL
+        for i in frozen_idx:
+            numpyro.deterministic(
+                f"frozen_{PARAM_NAMES[i]}",
+                jnp.float32(_LOG_MEAN_FULL[i]),
+            )
 
-    # -- Between-subject scale (half-normal priors on eta SDs) ----------------
-    scale_eta = numpyro.sample(
-        "scale_eta",
-        dist.HalfNormal(jnp.array([_LOG_SD_P_TH_2, _LOG_SD_K_SERCA], dtype=jnp.float32)),
-    )   # (D,)
+    # -- Between-subject covariance (LKJCholesky; active params only) ---------
+    if D_active > 1:
+        Omega_chol = numpyro.sample(
+            "Omega_chol",
+            dist.LKJCholesky(D_active, concentration=2.0),
+        )   # (D_active, D_active)
+        scale_eta = numpyro.sample(
+            "scale_eta",
+            dist.HalfNormal(_LOG_SD_FULL[jnp.array(active_idx, dtype=jnp.int32)]),
+        )   # (D_active,)
+        L_eta = jnp.diag(scale_eta) @ Omega_chol
+    elif D_active == 1:
+        scale_eta = numpyro.sample(
+            "scale_eta",
+            dist.HalfNormal(_LOG_SD_FULL[jnp.array(active_idx, dtype=jnp.int32)]),
+        )   # (1,)
+        L_eta = scale_eta.reshape(1, 1)
 
     # -- Observation noise (EMG, SmO2) ----------------------------------------
     sigma_emg  = numpyro.sample("sigma_emg",  dist.HalfNormal(jnp.float32(1.0)))
     sigma_smo2 = numpyro.sample("sigma_smo2", dist.HalfNormal(jnp.float32(1.0)))
     sigma_obs  = jnp.stack([sigma_emg, sigma_smo2])   # (2,)
 
-    # -- Subject-level parameters (Matt trick / non-centred) ------------------
-    with numpyro.plate("subjects", n_subjects):
-        eta_raw = numpyro.sample(
-            "eta_raw",
-            dist.Normal(
-                jnp.zeros(D, dtype=jnp.float32),
-                jnp.ones(D, dtype=jnp.float32),
-            ),
-        )   # (N_subjects, D)
+    # -- Subject-level random effects (non-centred; active params only) --------
+    if D_active > 0:
+        active_arr = jnp.array(active_idx, dtype=jnp.int32)
+        with numpyro.plate("subjects", n_subjects):
+            eta_raw = numpyro.sample(
+                "eta_raw",
+                dist.Normal(
+                    jnp.zeros(D_active, dtype=jnp.float32),
+                    jnp.ones(D_active,  dtype=jnp.float32),
+                ),
+            )   # (N_subjects, D_active)
 
-        eta_scaled = eta_raw * scale_eta[None, :]               # (N_subjects, D)
-        eta_corr   = jnp.einsum("ij,sj->si", Omega_chol, eta_scaled)  # (N_subjects, D)
+        eta_scaled = eta_raw * scale_eta[None, :]                   # (N_subjects, D_active)
+        eta_corr   = jnp.einsum("ij,sj->si", L_eta, eta_scaled)    # (N_subjects, D_active)
 
-        theta_i_log = theta_pop_log[None, :] + eta_corr         # (N_subjects, D)
-        theta_i     = jnp.exp(theta_i_log)                      # positive
+        # Scatter into full D space (frozen slots stay zero -> prior mean)
+        eta_full = jnp.zeros((n_subjects, D))
+        eta_full = eta_full.at[:, active_arr].set(eta_corr)
+    else:
+        eta_full = jnp.zeros((n_subjects, D))
+
+    theta_i_log = theta_pop_log[None, :] + eta_full   # (N_subjects, D)
+    theta_i     = jnp.exp(theta_i_log)                # positive
 
     # -- Forward simulation (vmap over subjects) --------------------------------
     obs_params = DEFAULT_V4_OBS_PARAMS
@@ -266,11 +314,12 @@ class NMv4NLME:
 
     def fit_svi(
         self,
-        data:     dict,
-        n_steps:  int   = 30_000,
-        lr:       float = 1e-3,
-        rank:     int   = 5,
-        rng_key:  int   = 42,
+        data:          dict,
+        frozen_params: tuple = (),
+        n_steps:       int   = 30_000,
+        lr:            float = 1e-3,
+        rank:          int   = 5,
+        rng_key:       int   = 42,
     ) -> dict:
         """
         Fit NLME model via SVI.
@@ -283,15 +332,19 @@ class NMv4NLME:
                "subject_ids"   : (N_total,) int32
                "obs_idx"       : (N_total,) int32
                "n_subjects"    : int
+        frozen_params : tuple[str] -- parameter names to pin at population prior mean.
+                        Valid values: any subset of PARAM_NAMES = ("P_th_2", "k_SERCA_base").
+                        Frozen params are excluded from the variational posterior.
 
         Returns
         -------
         dict: "svi_result", "elbo_history", "params", "guide"
         """
-        key   = jax.random.PRNGKey(rng_key)
-        guide = AutoLowRankMultivariateNormal(nm_v4_nlme_model, rank=rank)
-        optim = optax.adam(lr)
-        svi   = SVI(nm_v4_nlme_model, guide, optim, loss=Trace_ELBO())
+        key      = jax.random.PRNGKey(rng_key)
+        model_fn = functools.partial(nm_v4_nlme_model, frozen_params=tuple(frozen_params))
+        guide    = AutoLowRankMultivariateNormal(model_fn, rank=rank)
+        optim    = optax.adam(lr)
+        svi      = SVI(model_fn, guide, optim, loss=Trace_ELBO())
 
         svi_state = svi.init(
             key,

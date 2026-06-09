@@ -1,15 +1,10 @@
-from .nlme_model import (
-    AerobicNLME,
-    aerobic_nlme_model,
-    h_observer_from_vec,
-    D_THETA,
-    THETA_NAMES,
-)
-
-__all__ = [
-    "AerobicNLME",
-    "aerobic_nlme_model",
-    "h_observer_from_vec",
-    "D_THETA",
-    "THETA_NAMES",
-]
+# app/inference/__init__.py
+#
+# The 9-state aerobic_nlme_model that lived here has been deprecated.
+# Archived at: app/inference/_deprecated/nlme_model_9state.py
+#
+# Active NLME models live in each slice:
+#   app/slices/cardiorespiratory/nlme.py  (CardioNLME)
+#   app/slices/neuromuscular_tissue/nlme.py
+#   app/slices/neuroendocrine/nlme.py
+#   ... (one nlme.py per slice)

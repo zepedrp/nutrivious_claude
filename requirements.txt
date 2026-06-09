@@ -1,26 +1,55 @@
-sqlalchemy>=2.0.0
-alembic>=1.13.0
-psycopg2-binary>=2.9.9
-python-dotenv>=1.0.0
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy>=2.0,<3.0
+alembic>=1.13,<2.0
+psycopg2-binary>=2.9,<3.0
+python-dotenv>=1.0,<2.0
 
 # ── JAX / Scientific Computing Stack ─────────────────────────────────────────
-jax
-jaxlib
-diffrax
-equinox
-optax
+# Pin at minor to prevent silent API breakage between releases
+jax>=0.4.30,<0.5
+jaxlib>=0.4.30,<0.5
+diffrax>=0.6,<1.0
+equinox>=0.11,<1.0
+optax>=0.2,<1.0
 
 # ── Bayesian Inference / NLME ─────────────────────────────────────────────────
-numpyro
+numpyro>=0.15,<1.0
 
 # ── State Filtering ───────────────────────────────────────────────────────────
-dynamax
+dynamax>=0.1,<1.0
 
 # ── Control / Optimisation ───────────────────────────────────────────────────
-casadi
+casadi>=3.6,<4.0
+do-mpc>=4.6,<5.0          # required by app/control/nmpc_engine.py
+
+# ── Schema / Validation ───────────────────────────────────────────────────────
+pydantic>=2.0,<3.0         # required by app/schemas/ and app/compliance/
 
 # ── Surrogate / GP ────────────────────────────────────────────────────────────
-gpytorch
+gpytorch>=1.11,<2.0
 
-# ── Utilities ────────────────────────────────────────────────────────────────
-numpy
+# ── Data Processing ───────────────────────────────────────────────────────────
+numpy>=1.26,<3.0
+polars>=0.20,<1.0          # high-performance DataFrames for validation harness
+
+# ── Web / API ─────────────────────────────────────────────────────────────────
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+
+# ── Logging / Observability ───────────────────────────────────────────────────
+structlog>=24.0,<25.0
+
+# ── ML Experiment Tracking ───────────────────────────────────────────────────
+mlflow>=2.12,<3.0
+
+# ── Monitoring / Drift Detection ─────────────────────────────────────────────
+evidently>=0.4,<1.0
+nannyml>=0.11,<1.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0,<9.0
+hypothesis>=6.100,<7.0
+
+# ── Code Quality ──────────────────────────────────────────────────────────────
+ruff>=0.4,<1.0
+mypy>=1.10,<2.0

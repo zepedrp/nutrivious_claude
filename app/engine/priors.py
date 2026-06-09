@@ -203,12 +203,12 @@ BAYESIAN_PRIOR_MAPPINGS: MappingProxyType = MappingProxyType({
         "reference_value": 15.0,
         "units":           "g·dL⁻¹",
     }),
-    "DunedinPACE": MappingProxyType({
-        "prior_name":      "p3_biological_age_rate_prior",
+    "epigenetic_pace_index": MappingProxyType({
+        "prior_name":      "p3_epigenetic_pace_prior",
         "subsystem":       "reds_lea",
         "transform":       "direct",
         "reference_value": 1.0,
-        "units":           "yr_epigenetic·yr_calendar⁻¹",
+        "units":           "yr_epigenetic_per_yr_calendar",
     }),
     "measured_rmr": MappingProxyType({
         "prior_name":      "p3_energy_availability_prior",

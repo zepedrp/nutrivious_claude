@@ -55,24 +55,20 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from app.engine.assimilation.ukf_filter import (
-    AerobicTransitionParams,
-    GaussianState,
-    _ukf_predict,
+from app.engine.assimilation.ukf_filter import GaussianState
+from app.slices.cardiorespiratory.filter import (
+    _ukf_predict_cardio,
     Q_DEFAULT,
+    CardioTransitionParams,
 )
-from app.engine.observation.aerobic_observer import (
-    IDX_V_VAGAL,
-    IDX_W_PRIME,
-    STATE_DIM,
-)
+from app.slices.cardiorespiratory.ode import IDX_AT, IDX_WPRIME
 from app.control.nmpc_engine import NMPCAction
 
 logger = logging.getLogger(__name__)
 
-# ── State index aliases (clarity) ────────────────────────────────────────────
-_IX_V_VAGAL   = IDX_V_VAGAL   # 2
-_IX_W_PRIME   = IDX_W_PRIME   # 8
+# ── State index aliases — 6-state cardiorespiratory architecture ─────────────
+_IX_AT      = IDX_AT      # 5  Autonomic Tone (vagal tone proxy)
+_IX_WPRIME  = IDX_WPRIME  # 3  W'_bal [kJ]
 
 # ── Safety verdict ────────────────────────────────────────────────────────────
 
@@ -154,26 +150,25 @@ def _project_one_step(
     state_mean:        jax.Array,
     state_cov:         jax.Array,
     u:                 jax.Array,
-    transition_params: AerobicTransitionParams,
+    transition_params: CardioTransitionParams,
 ) -> tuple[jax.Array, jax.Array]:
     """
     JIT-compiled UKF predict step for PSF worst-case propagation.
 
     Parameters
     ----------
-    state_mean        : shape (STATE_DIM,)
+    state_mean        : shape (STATE_DIM,) — 6-state cardio vector
     state_cov         : shape (STATE_DIM, STATE_DIM)
-    u                 : shape (3,) — [power_w, sess_dur_min, 0]
-    transition_params : AerobicTransitionParams
+    u                 : shape (3,) — [power_w, hub_T_core, hub_pv_drop_pct]
+    transition_params : CardioTransitionParams (6-state)
 
     Returns
     -------
     (mean_next, cov_next)
     """
-    mean_next, cov_next = _ukf_predict(
+    return _ukf_predict_cardio(
         state_mean, state_cov, u, transition_params, Q_DEFAULT
     )
-    return mean_next, cov_next
 
 
 # ── Predictive Safety Filter ──────────────────────────────────────────────────
@@ -189,7 +184,7 @@ class PredictiveSafetyFilter:
 
     Typical usage
     ─────────────
-    psf = PredictiveSafetyFilter(SafetyConfig(), transition_params)
+    psf = PredictiveSafetyFilter(SafetyConfig(), cardio_transition_params)
 
     verdict = psf.evaluate(
         u_proposed       = nmpc_action,
@@ -214,7 +209,7 @@ class PredictiveSafetyFilter:
     def __init__(
         self,
         config:            SafetyConfig,
-        transition_params: AerobicTransitionParams,
+        transition_params: CardioTransitionParams,
     ) -> None:
         self.config            = config
         self.transition_params = transition_params
@@ -292,16 +287,16 @@ class PredictiveSafetyFilter:
 
         # ── (5) Verdict ───────────────────────────────────────────────────
         x_worst_report = (
-            float(x_mean[_IX_V_VAGAL]),
-            float(x_worst_lb[_IX_V_VAGAL]),
-            float(x_mean[_IX_W_PRIME]),
-            float(x_worst_lb[_IX_W_PRIME]),
+            float(x_mean[_IX_AT]),
+            float(x_worst_lb[_IX_AT]),
+            float(x_mean[_IX_WPRIME]),
+            float(x_worst_lb[_IX_WPRIME]),
         )
 
         if all_violations:
             logger.warning(
                 "PSF BLOCKED — violations: %s | "
-                "V_vag_worst=%.2f (≥%.2f), W'_worst=%.1f kJ (≥%.1f), "
+                "AT_worst=%.2f (≥%.2f), W'_worst=%.1f kJ (≥%.1f), "
                 "proposed: %.0fW × %.0fmin",
                 all_violations,
                 x_worst_report[1], cfg.V_vag_critical,
@@ -318,7 +313,7 @@ class PredictiveSafetyFilter:
             )
 
         logger.debug(
-            "PSF APPROVED — V_vag_worst=%.2f (≥%.2f), W'_worst=%.1f kJ (≥%.1f)",
+            "PSF APPROVED — AT_worst=%.2f (≥%.2f), W'_worst=%.1f kJ (≥%.1f)",
             x_worst_report[1], cfg.V_vag_critical,
             x_worst_report[3], cfg.W_prime_min,
         )
@@ -369,8 +364,8 @@ class PredictiveSafetyFilter:
         violations = []
 
         # ── W'_BAL ≥ 0 (Skiba 2015) ──────────────────────────────────────
-        # Use algebraic Skiba projection (consistent with ukf_filter.py)
-        w_prime_mean   = float(x_worst_lb[_IX_W_PRIME])  # worst: min of projected W'
+        # Use algebraic Skiba projection (consistent with cardio filter)
+        w_prime_mean   = float(x_worst_lb[_IX_WPRIME])   # worst: min of projected W'
         excess         = max(0.0, u.power_watts - cfg.CP_watts)
         w_depletion    = excess * (u.session_dur_min * 0.060)
         t_rest_min     = max(0.0, 24.0 * 60.0 - u.session_dur_min)
@@ -383,11 +378,11 @@ class PredictiveSafetyFilter:
                 f"W_prime_bal: projected={w_prime_projected:.1f} kJ < min={cfg.W_prime_min:.1f} kJ"
             )
 
-        # ── V_vagal ≥ V_vag_critical (Buchheit 2014) ─────────────────────
-        v_vag_worst = float(x_worst_lb[_IX_V_VAGAL])
-        if v_vag_worst < cfg.V_vag_critical:
+        # ── AT ≥ V_vag_critical (autonomic floor; Buchheit 2014) ─────────
+        at_worst = float(x_worst_lb[_IX_AT])
+        if at_worst < cfg.V_vag_critical:
             violations.append(
-                f"V_vagal: worst_case={v_vag_worst:.3f} < critical={cfg.V_vag_critical:.2f}"
+                f"AT: worst_case={at_worst:.3f} < critical={cfg.V_vag_critical:.2f}"
             )
 
         # ── ACWR ≤ acwr_max (Gabbett 2016) ───────────────────────────────

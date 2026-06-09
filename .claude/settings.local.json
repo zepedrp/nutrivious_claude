@@ -113,7 +113,12 @@
       "PowerShell(cd \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\"; py -m pytest tests/test_gastrointestinal_slice.py -v -s > \"pytest_gi_out.txt\" 2>&1; $ec = $LASTEXITCODE; Get-Content \"pytest_gi_out.txt\"; Write-Host \"EXIT:$ec\")",
       "PowerShell(cd \"c:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE\"; py -m pytest tests/test_gastrointestinal_slice.py -v -s > \"pytest_gi_v3.txt\" 2>&1; $ec = $LASTEXITCODE; Get-Content \"pytest_gi_v3.txt\"; Write-Host \"EXIT:$ec\")",
       "Bash(python -m pytest tests/test_neuromuscular_slice.py -v -s)",
-      "Bash(py -m pytest tests/test_neuromuscular_slice.py -v -s)"
+      "Bash(py -m pytest tests/test_neuromuscular_slice.py -v -s)",
+      "WebSearch",
+      "Bash(python -m pytest tests/test_cardiorespiratory_slice.py -v --tb=short)",
+      "Bash(python -c \"from app.slices.aerobic_pipeline import AerobicSliceOrchestrator\")",
+      "PowerShell(cd C:\\\\Users\\\\ZÉ\\\\NUTRIVIOUS_CALUDE; Get-ChildItem -Recurse | Where-Object { $_.Name -eq \"pytest_out.txt\" -or $_.Name -match \"^reports$\" } | Select-Object FullName | Select-Object -First 20)",
+      "Bash(py -m pytest tests/test_cardiorespiratory_slice.py tests/test_gate_zero.py -v -s --tb=short)"
     ],
     "additionalDirectories": [
       "c:\\Users\\ZÉ\\NUTRIVIOUS_CALUDE\\app\\slices",

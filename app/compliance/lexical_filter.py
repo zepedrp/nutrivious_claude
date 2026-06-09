@@ -49,7 +49,7 @@ except ImportError:          # pragma: no cover — optional in test environment
 from app.control.safety_filter import SafetyVerdict, SafetyVerdictStatus
 from app.control.nmpc_engine import NMPCAction
 from app.engine.assimilation.ukf_filter import GaussianState
-from app.engine.observation.aerobic_observer import IDX_V_VAGAL, IDX_W_PRIME
+from app.slices.cardiorespiratory.ode import IDX_AT, IDX_WPRIME
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +69,15 @@ class PathAViolationError(ValueError):
 # ── Semantic map: internal physiological name → wellness label ─────────────────
 
 SEMANTIC_MAP: dict[str, str] = {
-    # ── ODE state variables (Mod 3 cardiorespiratory + W'_bal) ────────────
-    "V_vagal":                           "Recovery Capacity",
+    # ── 6-state cardiorespiratory ODE variables ───────────────────────────
+    "Autonomic_Tone":                    "Recovery Capacity",
     "W_prime_bal":                       "Anaerobic Battery",
+    "Resp_Fatigue":                      "Respiratory Readiness",
+    "V_O2":                              "Oxygen Uptake",
+    "Heart_Rate":                        "Heart Rate",
+    "Stroke_Volume":                     "Cardiac Output",
+    # ── Legacy 9-state labels (kept for internal log compatibility) ───────
+    "V_vagal":                           "Recovery Capacity",
     "NE":                                "Arousal Level",
     "E":                                 "Activation Level",
     "P_a":                               "Cardiovascular Tone",
@@ -271,10 +277,10 @@ class PathAFilter:
         mean = np.array(state.mean, dtype=np.float64)
         std  = np.sqrt(np.maximum(0.0, np.diag(np.array(state.cov, dtype=np.float64))))
 
-        v_vag  = float(mean[IDX_V_VAGAL])
-        s_vvag = float(std[IDX_V_VAGAL])
-        w_kJ   = float(mean[IDX_W_PRIME])
-        s_wkJ  = float(std[IDX_W_PRIME])
+        v_vag  = float(mean[IDX_AT])
+        s_vvag = float(std[IDX_AT])
+        w_kJ   = float(mean[IDX_WPRIME])
+        s_wkJ  = float(std[IDX_WPRIME])
 
         w_pct  = (w_kJ  / self._W_PRIME_MAX_KJ) * 100.0
         s_wpct = (s_wkJ / self._W_PRIME_MAX_KJ) * 100.0

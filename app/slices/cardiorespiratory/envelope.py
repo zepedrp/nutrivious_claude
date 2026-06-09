@@ -220,8 +220,11 @@ def build_cardiorespiratory_envelope(
     try:
         engine_priors = build_engine_priors(adata, geno)
         bayesian_priors.update(engine_priors)
-    except Exception:
-        pass  # engine priors are optional; cardio slice self-contained
+    except Exception as _exc:
+        raise RuntimeError(
+            f"build_cardiorespiratory_envelope: engine_priors failed — {_exc}. "
+            "Envelope construction aborted (fail-loud; I1)."
+        ) from _exc
 
     return Phase3Envelope(
         bayesian_priors    = bayesian_priors,

@@ -78,9 +78,9 @@ except ImportError:  # pragma: no cover — optional dependency
     do_mpc  = None  # type: ignore[assignment]
     _DOMPC_OK = False
 
-from app.engine.observation.aerobic_observer import (
-    AerobicObserverParams,
-    DEFAULT_OBSERVER_PARAMS,
+from app.slices.cardiorespiratory.observation import (
+    CardioObsParams,
+    DEFAULT_OBS_PARAMS,
 )
 
 logger = logging.getLogger(__name__)
@@ -300,11 +300,12 @@ class AerobicNMPC:
         W_prime_sym = model.x["W_prime_bal"]
         power_sym   = model.u["power_watts"]
 
-        RMSSD_ref = casadi.DM(DEFAULT_OBSERVER_PARAMS.RMSSD_ref)
-        k_rmssd   = casadi.DM(DEFAULT_OBSERVER_PARAMS.k_rmssd)
+        RMSSD_ref = casadi.DM(DEFAULT_OBS_PARAMS.RMSSD_ref)
 
-        # RMSSD proxy from vagal tone (h_observer Eq. 2)
-        rmssd_proxy = RMSSD_ref * casadi.exp(k_rmssd * (V_vag_sym - casadi.DM(0.5)))
+        # Linear RMSSD proxy: RMSSD = RMSSD_ref × AT
+        # Matches 6-state obs model: h_cardio returns RMSSD_ref * Autonomic_Tone
+        # V_vag_sym in the planning model = Autonomic Tone analog
+        rmssd_proxy = RMSSD_ref * V_vag_sym
 
         # Power normalised deviation from target
         power_target = cfg.target_load_norm * cfg.power_max
@@ -431,19 +432,19 @@ class AerobicNMPC:
         w_prime_bal_kJ:    float,
         load_acute_Wh:     float,
         load_chronic_Wh:   float,
-        obs_params:        AerobicObserverParams | None = None,
+        obs_params:        CardioObsParams | None = None,
     ) -> NMPCAction:
         """
         Solve the NMPC problem and return the optimal training action.
 
         Parameters
         ----------
-        v_vagal_morning  : float — current morning vagal tone from UKF x[IDX_V_VAGAL]
-        w_prime_bal_kJ   : float — current W'_bal from UKF x[IDX_W_PRIME]
+        v_vagal_morning  : float — current morning AT from UKF x[IDX_AT]
+        w_prime_bal_kJ   : float — current W'_bal from UKF x[IDX_WPRIME]
         load_acute_Wh    : float — 7-day EWMA load [W·h] from training log
         load_chronic_Wh  : float — 28-day EWMA load [W·h] from training log
-        obs_params       : AerobicObserverParams | None — personalised observer params
-                           (used to update RMSSD_ref / k_rmssd if provided)
+        obs_params       : CardioObsParams | None — personalised observer params
+                           (used to update RMSSD_ref if provided)
 
         Returns
         -------
@@ -528,18 +529,18 @@ class AerobicNMPC:
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
-    def _update_rmssd_params(self, obs_params: AerobicObserverParams) -> None:
+    def _update_rmssd_params(self, obs_params: CardioObsParams) -> None:
         """
-        Update RMSSD_ref and k_rmssd in the objective from NLME posterior.
+        Update RMSSD_ref in the objective from NLME posterior.
 
-        Requires rebuilding the controller (objective depends on these params).
+        Requires rebuilding the controller (objective depends on RMSSD_ref).
         Only rebuilds if params differ significantly (>5%) to avoid overhead.
         """
-        ref_change = abs(obs_params.RMSSD_ref - DEFAULT_OBSERVER_PARAMS.RMSSD_ref)
-        if ref_change / DEFAULT_OBSERVER_PARAMS.RMSSD_ref > 0.05:
+        ref_change = abs(obs_params.RMSSD_ref - DEFAULT_OBS_PARAMS.RMSSD_ref)
+        if ref_change / DEFAULT_OBS_PARAMS.RMSSD_ref > 0.05:
             logger.debug(
                 "AerobicNMPC: RMSSD_ref updated %.1f→%.1f, rebuilding controller.",
-                DEFAULT_OBSERVER_PARAMS.RMSSD_ref, obs_params.RMSSD_ref,
+                DEFAULT_OBS_PARAMS.RMSSD_ref, obs_params.RMSSD_ref,
             )
             self._model = self._build_model()
             self._mpc   = self._build_controller(self._model)

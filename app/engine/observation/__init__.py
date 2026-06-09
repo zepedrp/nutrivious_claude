@@ -1,35 +1,10 @@
-from .aerobic_observer import (
-    AerobicObserverParams,
-    DEFAULT_OBSERVER_PARAMS,
-    h_observer,
-    h_observer_sigma,
-    STATE_DIM,
-    OBS_DIM,
-    IDX_NE,
-    IDX_E,
-    IDX_V_VAGAL,
-    IDX_P_A,
-    IDX_PACO2,
-    IDX_PBCO2,
-    IDX_SPO2,
-    IDX_V_E,
-    IDX_W_PRIME,
-)
-
-__all__ = [
-    "AerobicObserverParams",
-    "DEFAULT_OBSERVER_PARAMS",
-    "h_observer",
-    "h_observer_sigma",
-    "STATE_DIM",
-    "OBS_DIM",
-    "IDX_NE",
-    "IDX_E",
-    "IDX_V_VAGAL",
-    "IDX_P_A",
-    "IDX_PACO2",
-    "IDX_PBCO2",
-    "IDX_SPO2",
-    "IDX_V_E",
-    "IDX_W_PRIME",
-]
+# app/engine/observation/__init__.py
+#
+# The 9-state AerobicObserverParams that lived here has been deprecated.
+# Archived at: app/engine/observation/_deprecated/aerobic_observer_9state.py
+#
+# Active observation models live in each slice:
+#   app/slices/cardiorespiratory/observation.py  (6-state, h_cardio)
+#   app/slices/neuromuscular_tissue/observation.py
+#   app/slices/neuroendocrine/observation.py
+#   ... (one observation.py per slice)

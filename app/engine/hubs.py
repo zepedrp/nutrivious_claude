@@ -274,12 +274,11 @@ class HubState(NamedTuple):
     to each slice in operator-splitting order. Each slice returns a new
     HubState with its owned fields updated.
 
-    Operator-splitting order (intra-session, 1-min steps):
-        [1] Metabolic ODE predict  -- reads local_gly_norm(t-1), writes plasma_glucose(t)
-        [2] NM ODE predict         -- reads plasma_glucose(t),   writes local_gly_norm(t)
-        [3] Cardio ODE predict     -- reads plasma_glucose(t), autonomic_tone(t-1)
-        [4] Neuroendocrine         -- reads plasma_glucose(t), training_stress
-        ...
+    Parallel Federated Filtering topology (intra-session, 1-min steps):
+        All organs receive the same frozen hub_t snapshot and publish to hub_{t+1}.
+        No organ reads another organ's same-step output.
+
+        hub_t  ->  [NM || MG || Neuroendocrine || ThermoRenal || Cardio]  ->  hub_{t+1}
 
     Daily-scale slices (Gonadal, Hematological, Bone) run once per day
     using the session-end HubState as their control input.

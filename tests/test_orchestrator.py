@@ -1,8 +1,11 @@
 """
 tests/test_orchestrator.py — Gate Zero: PentaOrchestrator (5-Subsystem)
 
-Tests the operator-splitting orchestrator that fuses:
-    NM -> MG -> Neuroendocrine -> ThermoRenal -> Cardio
+Tests the Parallel Federated Filtering orchestrator that fuses:
+    NM || MG || Neuroendocrine || ThermoRenal || Cardio
+
+All five slices advance simultaneously from a frozen hub snapshot at time t.
+Hub(t+1) is reconstructed once from all five posteriors — no intra-step cascade.
 
 T1  test_penta_default_state_no_nan
         Cold-start default state must be NaN-free, all hubs finite.
@@ -16,13 +19,13 @@ T3  test_penta_step_exercise_updates_hub
         Single step at 250W. Assert:
           - hub.cortisol  mean is finite
           - hub.epinephrine mean is finite
-          - hub.core_temp mean ∈ [36.0, 42.0] °C
-          - hub.pv_drop_pct mean ∈ [0.0, 50.0] %
-          - hub.autonomic_tone mean ∈ [0.0, 1.0]
+          - hub.core_temp mean in [36.0, 42.0] C
+          - hub.pv_drop_pct mean in [0.0, 50.0] %
+          - hub.autonomic_tone mean in [0.0, 1.0]
 
 T4  test_penta_10_steps_no_nan
         10 consecutive steps at 200W. Assert no NaN at any step.
-        Confirms operator-splitting doesn't accumulate NaN across steps.
+        Confirms parallel co-simulation does not accumulate NaN across steps.
 
 T5  test_trio_legacy_compat
         TrioOrchestrator (legacy alias) still works after orchestrator rewrite.
@@ -185,7 +188,7 @@ def test_penta_step_exercise_updates_hub():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_penta_10_steps_no_nan():
-    """10 steps at 200W — operator splitting must not accumulate NaN."""
+    """10 steps at 200W — parallel co-simulation must not accumulate NaN."""
     orch  = PentaOrchestrator()
     state = PentaOrchestrator.default_state()
 

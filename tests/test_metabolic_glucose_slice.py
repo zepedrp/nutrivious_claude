@@ -1,5 +1,10 @@
 """
-tests/test_metabolic_glucose_slice.py -- Metabolic Glucose V2.0 Gate Zero
+tests/test_metabolic_glucose_slice.py -- Metabolic Glucose V3.0 Gate Zero
+
+V3.0 changes:
+  - Muscle_Glycogen_g state REMOVED (NM is sole glycogen owner).
+  - Lactate index is now x[4] (was x[5]).
+  - hub_local_gly_norm added as hubs[4] (NM -> MG coupling, Cori Cycle).
 
 T1  test_epinephrine_glucose_spike
     hub_Epinephrine = 2000 pg/mL (fight-or-flight, no CHO).
@@ -12,10 +17,15 @@ T2  test_cortisol_insulin_resistance
     Assertion: Plasma_Glucose at t=30 min >= 10 mg/dL higher in stress scenario
     (cortisol exponentially suppresses IS_eff -> impaired glucose clearance).
 
-T3  test_muscle_glycogen_depletion
-    hub_power_watts = 400 W for 30 min.
-    Assertions: (a) Muscle_Glycogen drops > 15% of initial (substantial depletion)
-                (b) Lactate rises above 2.0 mmol/L (anaerobic threshold exceeded).
+T3  test_cori_cycle_lactate_coupling (REPLACES old muscle glycogen test)
+    hub_power_watts = 400 W for 30 min, hub_local_gly_norm = 1.0 (full tank).
+    Assertions:
+        (a) Lactate rises above 2.0 mmol/L (anaerobic flux from high power).
+        (b) With hub_local_gly_norm = 0.1 (depleted): Lactate production
+            is significantly lower than full-tank scenario
+            (NM glycogen gates anaerobic glycolytic flux).
+        (c) Cori cycle: at high lactate (8 mmol/L IC), Plasma_Glucose is
+            higher than at basal lactate (1 mmol/L IC) -- Ra_cori active.
 
 T4  test_ukf_cgm_assimilation
     60 steps of 1-min CGM assimilation (90 +/- 5 mg/dL synthetic trace).
@@ -34,12 +44,12 @@ from app.slices.metabolic_glucose.ode import (
     X0_DEFAULT,
     HUBS_DEFAULT,
     IDX_G,
-    IDX_MG,
     IDX_LAC,
     HUB_CHO,
     HUB_EPI,
     HUB_CORT,
     HUB_POW,
+    HUB_GLY_NORM,
 )
 from app.slices.metabolic_glucose.filter import MetabolicGlucoseFilter, P0_DEFAULT
 from app.engine.assimilation.ukf_filter import GaussianState
@@ -51,7 +61,7 @@ def _run_ode(
     dt_min: float = 30.0,
     params=DEFAULT_PARAMS,
 ) -> jax.Array:
-    """Integrate the 6-state glucose ODE for dt_min minutes; return final state."""
+    """Integrate the 5-state glucose ODE for dt_min minutes; return final state."""
     sol = diffrax.diffeqsolve(
         terms    = diffrax.ODETerm(metabolic_glucose_ode),
         solver   = diffrax.Tsit5(),
@@ -111,29 +121,46 @@ def test_cortisol_insulin_resistance():
     )
 
 
-# -- T3: Muscle glycogen depletion + lactate rise
-def test_muscle_glycogen_depletion():
+# -- T3: Cori Cycle + NM hub coupling (replaces old muscle glycogen test)
+def test_cori_cycle_lactate_coupling():
     """
-    hub_power_watts = 400 W for 30 min (hard VO2max effort).
-    Assertions:
-        (a) Muscle_Glycogen drops > 15% of initial (strong depletion).
-        (b) Lactate rises above 2.0 mmol/L (anaerobic flux).
+    T3a: 400 W + full glycogen -> lactate > 2.0 mmol/L (anaerobic flux).
+    T3b: 400 W + depleted glycogen (gly_norm=0.1) -> lower lactate
+         (hub_local_gly_norm gates anaerobic lac production).
+    T3c: Cori cycle active: high initial Lac (8 mmol/L) -> Plasma_Glucose
+         higher than low-Lac start (Ra_cori contributes hepatic glucose).
     """
-    hubs_ex = HUBS_DEFAULT.at[HUB_POW].set(jnp.float32(400.0))
-    x_final = _run_ode(X0_DEFAULT, hubs_ex, dt_min=30.0)
-
-    MG_init  = float(X0_DEFAULT[IDX_MG])
-    MG_final = float(x_final[IDX_MG])
-    Lac_final = float(x_final[IDX_LAC])
-
-    print(f"\nT3: MG_init={MG_init:.0f}g  MG_final={MG_final:.0f}g  drop={100*(MG_init-MG_final)/MG_init:.1f}%  Lac={Lac_final:.2f} mmol/L")
-    assert MG_final < MG_init * 0.85, (
-        f"Muscle glycogen should deplete strongly at 400 W: "
-        f"MG_final={MG_final:.1f} g (expected < {MG_init * 0.85:.1f} g)"
+    # T3a: high power + full NM glycogen
+    hubs_ex_full = HUBS_DEFAULT.at[HUB_POW].set(jnp.float32(400.0))
+    hubs_ex_full = hubs_ex_full.at[HUB_GLY_NORM].set(jnp.float32(1.0))
+    x_full = _run_ode(X0_DEFAULT, hubs_ex_full, dt_min=30.0)
+    Lac_full = float(x_full[IDX_LAC])
+    print(f"\nT3a: 400W+full_gly: Lac={Lac_full:.2f} mmol/L")
+    assert Lac_full > 2.0, (
+        f"Lactate should rise with 400W + full glycogen: Lac={Lac_full:.2f} (expected > 2.0)"
     )
-    assert Lac_final > 2.0, (
-        f"Lactate should rise with high-power exercise: "
-        f"Lac_final={Lac_final:.2f} mmol/L (expected > 2.0)"
+
+    # T3b: same power + depleted NM glycogen -> less anaerobic glycolysis
+    hubs_ex_depl = HUBS_DEFAULT.at[HUB_POW].set(jnp.float32(400.0))
+    hubs_ex_depl = hubs_ex_depl.at[HUB_GLY_NORM].set(jnp.float32(0.1))
+    x_depl = _run_ode(X0_DEFAULT, hubs_ex_depl, dt_min=30.0)
+    Lac_depl = float(x_depl[IDX_LAC])
+    print(f"T3b: 400W+depleted_gly(0.1): Lac={Lac_depl:.2f} mmol/L  ratio={Lac_full/Lac_depl:.2f}x")
+    assert Lac_depl < Lac_full, (
+        f"Depleted glycogen should reduce anaerobic lactate flux: "
+        f"Lac_depl={Lac_depl:.2f} should be < Lac_full={Lac_full:.2f}"
+    )
+
+    # T3c: Cori cycle -- high initial lactate -> more hepatic gluconeogenesis
+    x0_hi_lac = X0_DEFAULT.at[IDX_LAC].set(jnp.float32(8.0))
+    x_hi = _run_ode(x0_hi_lac, HUBS_DEFAULT, dt_min=30.0)
+    x_lo = _run_ode(X0_DEFAULT, HUBS_DEFAULT, dt_min=30.0)   # Lac_0=1.0
+    G_hi = float(x_hi[IDX_G])
+    G_lo = float(x_lo[IDX_G])
+    print(f"T3c: Cori cycle: G(Lac0=8)={G_hi:.1f}  G(Lac0=1)={G_lo:.1f}  delta={G_hi - G_lo:.1f} mg/dL")
+    assert G_hi > G_lo, (
+        f"Cori cycle: high initial lactate should elevate plasma glucose via Ra_cori: "
+        f"G_hi={G_hi:.1f} vs G_lo={G_lo:.1f} (expected G_hi > G_lo)"
     )
 
 
@@ -143,7 +170,7 @@ def test_ukf_cgm_assimilation():
     Assimilate 60 steps of synthetic CGM (1-min, 90 +/- 5 mg/dL).
     Assertions:
         (a) posterior_mean NaN-free after 60 updates (alpha=0.10 mandatory).
-        (b) covariance diagonal all positive (jitter 1e-3 guarantees PSD).
+        (b) covariance diagonal all positive (variance_floor + nearest_psd).
     """
     filt  = MetabolicGlucoseFilter()
     state = GaussianState(mean=X0_DEFAULT, cov=P0_DEFAULT)

@@ -1,34 +1,48 @@
 """
-app/slices/metabolic_glucose/ode.py -- Metabolic Glucose V2.0
+app/slices/metabolic_glucose/ode.py -- Metabolic Glucose V3.0
 
-6-state ODE coupled to Neuroendocrine hub variables.
-Time unit: MINUTES.
+5-state ODE. Muscle_Glycogen_g (old x[4]) REMOVED: the Neuromuscular slice is
+the sole authority on local glycogen (via hub_local_gly_norm). This eliminates
+the thermodynamic double-accounting of a shared metabolite.
 
-State x in R^6:
+Mass-conservation protocol (operator-splitting):
+  [1] NM predict step advances Muscle_Glycogen_mmolkg -> publishes hub_local_gly_norm
+  [2] MG predict step reads hub_local_gly_norm to scale anaerobic lactate flux
+  [3] Cori Cycle: elevated plasma lactate -> hepatic gluconeogenesis (Ra_cori)
+
+State x in R^5:
     x[0]  Plasma_Glucose_mgdL  [mg/dL]    fasting ~90
     x[1]  Insulin_pmolL        [pmol/L]   fasting ~50
     x[2]  Glucagon_pgmL        [pg/mL]    fasting ~80
     x[3]  Liver_Glycogen_g     [g]        fasting ~70 (LG_max=80)
-    x[4]  Muscle_Glycogen_g    [g]        fasting ~350 (MG_max=400)
-    x[5]  Lactate_mmolL        [mmol/L]   fasting ~1.0
+    x[4]  Lactate_mmolL        [mmol/L]   fasting ~1.0
 
-Hub inputs hubs in R^4 (NaN-guarded via jnp.where(jnp.isnan)):
+Hub inputs hubs in R^5 (NaN-guarded):
     hubs[0]  hub_cho_absorption_g_min  [g/min]   from GI slice
     hubs[1]  hub_Epinephrine_pgmL      [pg/mL]   from neuroendocrine SAM axis
     hubs[2]  hub_Cortisol_nmolL        [nmol/L]  from neuroendocrine HPA axis
     hubs[3]  hub_power_watts           [W]        from exercise / training
+    hubs[4]  hub_local_gly_norm        [0-1]      from NM slice (sole glycogen owner)
 
 Physics:
-    Plasma_Glucose: Ra_gut (CHO absorption) + EGP (gluconeogenesis + Epi/Gc-
-                    stimulated glycogenolysis via Michaelis-Menten) - Rd_insulin
-                    (IS suppressed exponentially by chronic Cortisol) - Rd_exercise
+    Plasma_Glucose: Ra_gut + EGP (gluconeogenesis + Epi/Gc glycogenolysis)
+                    + Ra_cori (Cori cycle: plasma lactate -> hepatic gluconeogenesis)
+                    - Rd_insulin (IS suppressed exponentially by chronic Cortisol)
+                    - Rd_exercise
     Insulin:        beta-cell glucose-stimulated secretion - clearance
     Glucagon:       basal + hypoglycemia drive + Epi counterregulation - clearance
     Liver_Glycogen: post-meal synthesis (insulin x glucose) - glycogenolysis drain
-    Muscle_Glycogen:exercise depletion (power x MG_frac) + insulin recovery
-    Lactate:        quadratic anaerobic production (power^2 x MG_frac) - Cori clearance
+    Lactate:        quadratic anaerobic production (power^2 x local_gly_norm)
+                    + basal Cori - Cori clearance
 
-Steady-state verification (fasting, Epi=50 pg/mL, Cort=300 nmol/L, power=0):
+Cori Cycle connection (NM -> MG):
+    hub_local_gly_norm gates anaerobic glycolytic flux (lac_prod_ex).
+    Elevated plasma lactate accelerates hepatic gluconeogenesis (Ra_cori),
+    which quantifies the Cori cycle as a direct NM->MG substrate bridge.
+
+Steady-state verification (fasting, Epi=50 pg/mL, Cort=300 nmol/L, power=0,
+                           local_gly_norm=1.0, Lac=1.0):
+    Ra_cori = k_Lac_cori * max(0, 1.0 - 1.0) = 0.0   (inactive at rest)
     EGP = 0.312 + 0.764 * 0.875 * 0.70 = 0.78 mg/dL/min
     Rd  = 0.010 * 50 * 90/180 + 0.53   = 0.25 + 0.53 = 0.78  CHECK
 
@@ -36,6 +50,8 @@ References:
     Dalla Man et al. (2007) IEEE TBME 54:1740-1749
     Cryer (2001) J Clin Invest 108:1533-1535
     Coyle et al. (1986) J Appl Physiol 61:165-172
+    Cori C.F. (1929) J Biol Chem 81:389  [Cori cycle: lactate -> liver glucose]
+    Brooks G.A. (2018) Cell Metab 27:757-785  [lactate shuttle]
 """
 from __future__ import annotations
 from typing import NamedTuple
@@ -48,27 +64,29 @@ IDX_G   = 0   # Plasma_Glucose_mgdL
 IDX_I   = 1   # Insulin_pmolL
 IDX_GC  = 2   # Glucagon_pgmL
 IDX_LG  = 3   # Liver_Glycogen_g
-IDX_MG  = 4   # Muscle_Glycogen_g
-IDX_LAC = 5   # Lactate_mmolL
+IDX_LAC = 4   # Lactate_mmolL   (was x[5] in V2.0)
 
-STATE_DIM: int = 6
+STATE_DIM: int = 5
 OBS_DIM:   int = 2   # [CGM glucose mg/dL, capillary lactate mmol/L]
 
 # -- Hub indices
-HUB_CHO  = 0
-HUB_EPI  = 1
-HUB_CORT = 2
-HUB_POW  = 3
-HUB_DIM  = 4
+HUB_CHO     = 0
+HUB_EPI     = 1
+HUB_CORT    = 2
+HUB_POW     = 3
+HUB_GLY_NORM = 4   # hub_local_gly_norm from NM slice [0-1]
+HUB_DIM: int = 5
 
 
 class GlucoseMetabParams(NamedTuple):
     """
-    Parameters for the 6-state metabolic glucose ODE.
+    Parameters for the 5-state metabolic glucose ODE V3.0.
 
     NLME-identifiable (D=2):
         IS_0   -- insulin sensitivity baseline  Prior: LogN(log 0.010, 0.30^2)
         LG_max -- liver glycogen capacity [g]   Prior: N(80, 10^2)
+
+    Muscle_Glycogen removed: NM is sole owner (V3.0).
     """
     # Body composition
     BW:  float = 70.0     # kg
@@ -81,9 +99,8 @@ class GlucoseMetabParams(NamedTuple):
     Epi_b:  float = 50.0    # pg/mL
     Cort_b: float = 300.0   # nmol/L
 
-    # Glycogen capacities
+    # Glycogen capacities (liver only; muscle belongs to NM)
     LG_max: float = 80.0    # g   [NLME-identifiable D=1]
-    MG_max: float = 400.0   # g
 
     # Basal EGP components (sum = 0.78 mg/dL/min at fasting SS)
     EGP_gng:   float = 0.312   # mg/dL/min  gluconeogenesis background
@@ -118,33 +135,35 @@ class GlucoseMetabParams(NamedTuple):
     # Liver glycogen synthesis
     k_LG_syn: float = 0.0010    # g/min per pmol/L I per mg/dL above Gb
 
-    # Muscle glycogen kinetics
-    k_MG_ex:  float = 0.0104    # g/min per W  (400 W -> ~4 g/min)
-    k_MG_syn: float = 0.0003    # g/min per pmol/L I
-
     # Lactate kinetics
     k_Lac_basal: float = 0.040  # mmol/L/min  resting Cori cycle steady-state
     k_Lac_ex:    float = 0.080  # mmol/L/min  quadratic anaerobic scaling
     k_Lac_clear: float = 0.040  # min^-1  Cori cycle clearance
 
+    # Cori Cycle: plasma lactate -> hepatic gluconeogenesis
+    # Ra_cori = k_Lac_cori * max(0, Lac - 1.0) [mg/dL/min per mmol/L excess]
+    # Inactive at fasting (Lac=1.0); contributes ~0.14 mg/dL/min at Lac=8.
+    # Calibrated: ~18% of resting EGP per 7 mmol/L excess lactate (Brooks 2018).
+    k_Lac_cori: float = 0.020   # mg/dL/min per mmol/L above basal
+
 
 DEFAULT_PARAMS: GlucoseMetabParams = GlucoseMetabParams()
 
-# -- Default state, hubs, and initial covariance
+# -- Default state and hubs (5-state V3.0)
 X0_DEFAULT: jax.Array = jnp.array([
     90.0,    # G    [mg/dL]
     50.0,    # I    [pmol/L]
     80.0,    # Gc   [pg/mL]
     70.0,    # LG   [g]
-    350.0,   # MG   [g]
     1.0,     # Lac  [mmol/L]
 ], dtype=jnp.float32)
 
 HUBS_DEFAULT: jax.Array = jnp.array([
-    0.0,    # cho_absorption  [g/min]
-    50.0,   # Epinephrine     [pg/mL]
-    300.0,  # Cortisol        [nmol/L]
-    0.0,    # power           [W]
+    0.0,    # cho_absorption    [g/min]
+    50.0,   # Epinephrine       [pg/mL]
+    300.0,  # Cortisol          [nmol/L]
+    0.0,    # power             [W]
+    1.0,    # local_gly_norm    [0-1]  full glycogen at rest
 ], dtype=jnp.float32)
 
 P0_DEFAULT: jax.Array = jnp.diag(jnp.array([
@@ -152,7 +171,6 @@ P0_DEFAULT: jax.Array = jnp.diag(jnp.array([
     25.0,    # I   sigma^2 = 5^2
     100.0,   # Gc  sigma^2 = 10^2
     25.0,    # LG  sigma^2 = 5^2
-    400.0,   # MG  sigma^2 = 20^2
     1.0,     # Lac sigma^2 = 1^2
 ], dtype=jnp.float32))
 
@@ -164,17 +182,17 @@ def metabolic_glucose_ode(
     args: tuple,
 ) -> jax.Array:
     """
-    6-state metabolic glucose ODE with neuroendocrine hub coupling.
+    5-state metabolic glucose ODE V3.0 with hub coupling.
 
     Parameters
     ----------
     t    : scalar [min]
-    x    : (STATE_DIM,)
+    x    : (STATE_DIM,) = (5,)
     args : (GlucoseMetabParams, hubs[HUB_DIM])
 
     Returns
     -------
-    dx/dt : (STATE_DIM,)
+    dx/dt : (STATE_DIM,) = (5,)
     """
     params, hubs = args
     Vd_dL = params.BW * params.Vg   # ~131.6 dL
@@ -184,32 +202,37 @@ def metabolic_glucose_ode(
     I_safe   = jnp.maximum(x[IDX_I],   0.0)
     Gc_safe  = jnp.maximum(x[IDX_GC],  0.0)
     LG_safe  = jnp.maximum(x[IDX_LG],  0.0)
-    MG_safe  = jnp.maximum(x[IDX_MG],  0.0)
     Lac_safe = jnp.maximum(x[IDX_LAC], 0.0)
 
-    # -- NaN guards on all hub variables (Physics Boundary)
-    hub_cho  = jnp.where(jnp.isnan(hubs[HUB_CHO]),  jnp.float32(0.0),   hubs[HUB_CHO])
-    hub_Epi  = jnp.where(jnp.isnan(hubs[HUB_EPI]),  jnp.float32(50.0),  hubs[HUB_EPI])
-    hub_Cort = jnp.where(jnp.isnan(hubs[HUB_CORT]), jnp.float32(300.0), hubs[HUB_CORT])
-    hub_pow  = jnp.where(jnp.isnan(hubs[HUB_POW]),  jnp.float32(0.0),   hubs[HUB_POW])
+    # -- NaN guards on all hub variables
+    hub_cho      = jnp.where(jnp.isnan(hubs[HUB_CHO]),      jnp.float32(0.0),   hubs[HUB_CHO])
+    hub_Epi      = jnp.where(jnp.isnan(hubs[HUB_EPI]),      jnp.float32(50.0),  hubs[HUB_EPI])
+    hub_Cort     = jnp.where(jnp.isnan(hubs[HUB_CORT]),     jnp.float32(300.0), hubs[HUB_CORT])
+    hub_pow      = jnp.where(jnp.isnan(hubs[HUB_POW]),      jnp.float32(0.0),   hubs[HUB_POW])
+    hub_gly_norm = jnp.where(jnp.isnan(hubs[HUB_GLY_NORM]), jnp.float32(1.0),   hubs[HUB_GLY_NORM])
 
-    hub_cho  = jnp.maximum(hub_cho, 0.0)
-    hub_Epi  = jnp.clip(hub_Epi,  0.0, 5000.0)
-    hub_Cort = jnp.clip(hub_Cort, 0.0, 2000.0)
-    hub_pow  = jnp.clip(hub_pow,  0.0, 1000.0)
+    hub_cho      = jnp.maximum(hub_cho, 0.0)
+    hub_Epi      = jnp.clip(hub_Epi,  0.0, 5000.0)
+    hub_Cort     = jnp.clip(hub_Cort, 0.0, 2000.0)
+    hub_pow      = jnp.clip(hub_pow,  0.0, 1000.0)
+    hub_gly_norm = jnp.clip(hub_gly_norm, 0.0, 2.0)   # guard: NM glycogen norm
 
     # -- Gut CHO absorption -> plasma glucose rate
     Ra_gut = hub_cho * 1000.0 / Vd_dL   # mg/dL/min
 
     # -- Hepatic EGP: gluconeogenesis + Michaelis-Menten glycogenolysis
-    #    Epi stimulates glycogenolysis (fight-or-flight response)
-    #    Glucagon stimulates glycogenolysis (hypoglycemia response)
-    Epi_mm  = hub_Epi  / (hub_Epi  + params.K_Epi_gly)   # in [0, 1]
-    Gc_mm   = Gc_safe  / (Gc_safe  + params.K_Gc_gly)     # in [0, 1]
-    stim    = Epi_mm + Gc_mm                               # in [0, 2]
-    LG_frac = LG_safe / params.LG_max                      # in [0, 1]
-    Ra_gly   = params.k_EGP_gly * LG_frac * stim
+    Epi_mm  = hub_Epi  / (hub_Epi  + params.K_Epi_gly)
+    Gc_mm   = Gc_safe  / (Gc_safe  + params.K_Gc_gly)
+    stim    = Epi_mm + Gc_mm
+    LG_frac = LG_safe / params.LG_max
+    Ra_gly  = params.k_EGP_gly * LG_frac * stim
     Ra_liver = params.EGP_gng + Ra_gly
+
+    # -- Cori Cycle: plasma lactate excess -> hepatic gluconeogenesis
+    # Inactive at basal lactate (1.0 mmol/L); activates during exercise.
+    # Connects NM anaerobic glycolysis (via elevated plasma Lac) to hepatic EGP.
+    lac_excess = jnp.maximum(Lac_safe - jnp.float32(1.0), jnp.float32(0.0))
+    Ra_cori    = jnp.float32(params.k_Lac_cori) * lac_excess
 
     # -- Insulin-mediated disposal; IS suppressed exponentially by chronic cortisol
     cort_excess = jnp.maximum(hub_Cort - params.Cort_b, 0.0)
@@ -219,10 +242,10 @@ def metabolic_glucose_ode(
     # -- Exercise uptake (AMPK, non-insulin-dependent)
     Rd_ex = params.k_ex * (hub_pow / 100.0) * G_safe / (params.Km_G + G_safe)
 
-    # Block a: dG/dt
-    dG = Ra_gut + Ra_liver - Rd_ins - Rd_ex - params.Fcns
+    # dG/dt: includes Cori cycle gluconeogenesis
+    dG = Ra_gut + Ra_liver + Ra_cori - Rd_ins - Rd_ex - params.Fcns
 
-    # Block b: dI/dt (beta-cell secretion)
+    # dI/dt (beta-cell secretion)
     G_above = jnp.maximum(x[IDX_G] - params.Gb, 0.0)
     S_ins   = params.Sb + params.K_beta * G_above
     dI      = S_ins - params.k_I * I_safe
@@ -234,20 +257,14 @@ def metabolic_glucose_ode(
     dGc          = Gc_sec - params.k_Gc_clear * Gc_safe
 
     # dLG/dt (liver glycogen: synthesis - glycogenolysis drain)
-    gly_rate_g = params.k_EGP_gly * LG_frac * stim * Vd_dL / 1000.0   # g/min
+    gly_rate_g = params.k_EGP_gly * LG_frac * stim * Vd_dL / 1000.0
     LG_room    = jnp.maximum(params.LG_max - LG_safe, 0.0) / params.LG_max
     LG_syn     = params.k_LG_syn * I_safe * G_above * LG_room
     dLG        = LG_syn - gly_rate_g
 
-    # Block c: dMG/dt (muscle glycogen depleted mechanically by hub_power_watts)
-    MG_frac = MG_safe / params.MG_max
-    MG_depl = params.k_MG_ex * hub_pow * MG_frac
-    MG_room = jnp.maximum(params.MG_max - MG_safe, 0.0) / params.MG_max
-    MG_syn  = params.k_MG_syn * I_safe * G_above * MG_room
-    dMG     = MG_syn - MG_depl
-
-    # Block d: dLac/dt (quadratic anaerobic production at threshold + Cori clearance)
-    lac_prod_ex = params.k_Lac_ex * (hub_pow / 200.0) ** 2.0 * MG_frac
+    # dLac/dt: anaerobic production scaled by NM local_gly_norm (hub coupling)
+    # Cori clearance term represents lactate uptake by liver for gluconeogenesis.
+    lac_prod_ex = params.k_Lac_ex * (hub_pow / 200.0) ** 2.0 * hub_gly_norm
     dLac = params.k_Lac_basal + lac_prod_ex - params.k_Lac_clear * Lac_safe
 
-    return jnp.stack([dG, dI, dGc, dLG, dMG, dLac])
+    return jnp.stack([dG, dI, dGc, dLG, dLac])

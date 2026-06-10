@@ -1,8 +1,12 @@
 """
 app/slices/neuromuscular_tissue/filter.py
 
-L4 State Filter V4.0 -- Neuromuscular Tissue Slice
+L4 State Filter V4.1 -- Neuromuscular Tissue Slice
 Unscented Kalman Filter for the 6-state intra-session system (minutes timescale).
+
+Refactored to use canonical UKF primitives from app.engine.assimilation.ukf_filter,
+eliminating the local Cholesky-fragile sigma-point path in V4.0. Same gold
+standard as the Cardiorespiratory slice.
 
 State x in R^6:
     [ATP_Muscle_mmol, Calcium_Cytosolic_uM,
@@ -15,24 +19,15 @@ Observations y in R^2:
 UKF parametrisation (van der Merwe & Wan 2000)
 -----------------------------------------------
     alpha = 0.10  MANDATORY for float32 stability with n=6.
-                  W0_mean = lambda/(n+lambda) = 1 - 1/alpha^2 = -99.0
-                  INDEPENDENT of n -- safe for float32.
-                  Wi_mean = 0.5 / (n+lambda) = 0.5 / 0.06 = 8.333...
-                  With alpha=0.001: n+lambda=6e-6 -> Wi~83333 -> catastrophic.
+                  Wm[0] = 1 - 1/alpha^2 = -99.0  (n-independent).
     beta  = 2.0   Gaussian kurtosis prior
     kappa = 0.0
     n     = 6  ->  2n+1 = 13 sigma points
-    lambda = alpha^2*(n+kappa) - n = 0.01*6 - 6 = -5.94
-    n+lambda = 0.06
 
-Numerical stabilisation (mandatory)
---------------------------------------
-    Jitter 1e-3:   before each Cholesky: chol((n+lambda)*P + 1e-3*I)
-    Clamp post-predict: physical bounds applied to all sigma points after ODE
-    Floor diagonal 1e-3: after update: P_ii = max(P_ii, 1e-3)
-
-Transition: 1-minute Tsit5 ODE integration.
-Sigma-point propagation via jax.vmap over 13 ODE solves.
+Truncated UKF (Simon 2010):
+    1. Predict: sigma_points(eigh, PSD-robust) -> vmap ODE -> unscented_transform
+    2. Update:  sigma_points(eigh) -> h_nm_v4 -> Kalman gain
+    3. Post:    lower_clamp_moments + range_clamp_moments + variance_floor + nearest_psd
 
 Fail-Loud contract
 ------------------
@@ -42,6 +37,7 @@ Fail-Loud contract
 References
 ----------
     van der Merwe & Wan (2000) Proc. ASSPCC
+    Simon D. (2010) Optimal State Estimation, Wiley
 """
 from __future__ import annotations
 
@@ -69,33 +65,30 @@ from app.slices.neuromuscular_tissue.observation import (
     inflate_R_nm_v4,
     R_NM_V4_DEFAULT,
 )
-from app.engine.assimilation.ukf_filter import GaussianState
+from app.engine.assimilation.ukf_filter import (
+    GaussianState,
+    ukf_weights,
+    sigma_points,
+    unscented_transform,
+    nearest_psd,
+    variance_floor,
+    lower_clamp_moments,
+    range_clamp_moments,
+    clamp_dim,
+)
 
 logger = logging.getLogger(__name__)
 
 # -- UKF constants (alpha=0.10, n=6) -------------------------------------------
 
-_ALPHA  = 0.10
-_BETA   = 2.0
-_KAPPA  = 0.0
-_N      = STATE_DIM   # 6
+_ALPHA: float = 0.10
+_BETA:  float = 2.0
+_KAPPA: float = 0.0
+_N:     int   = STATE_DIM   # 6
 
-_LAMBDA   = _ALPHA ** 2 * (_N + _KAPPA) - _N   # = 0.06 - 6 = -5.94
-_N_LAMBDA = _N + _LAMBDA                         # = 0.06
-_JITTER   = 1e-3                                 # added to (n+lambda)*P before Cholesky
-
-_W0_MEAN: float = _LAMBDA / _N_LAMBDA                          # = -99.0  (same as n=5 case)
-_WI_MEAN: float = 0.5 / _N_LAMBDA                              # = 8.333...
-_W0_COV:  float = _W0_MEAN + (1.0 - _ALPHA ** 2 + _BETA)      # = -96.01 (same as n=5 case)
-_WI_COV:  float = _WI_MEAN                                     # = 8.333...
-
-_WM: jax.Array = jnp.array(
-    [_W0_MEAN] + [_WI_MEAN] * (2 * _N), dtype=jnp.float32
-)   # shape (13,)
-
-_WC: jax.Array = jnp.array(
-    [_W0_COV] + [_WI_COV] * (2 * _N), dtype=jnp.float32
-)   # shape (13,)
+_WM, _WC, _LAM = ukf_weights(_N, _ALPHA, _BETA, _KAPPA)
+# lambda = 0.01*6 - 6 = -5.94; (n+lambda) = 0.06
+# Wm[0] = -99.0; Wi = 8.333...
 
 # -- Process noise (per 1-minute step) -----------------------------------------
 
@@ -110,19 +103,16 @@ _Q_DIAG: jax.Array = jnp.array([
 
 Q_DEFAULT: jax.Array = jnp.diag(_Q_DIAG)
 
+# -- Simon 2010 variance floor (post-update minimum variance per dimension) -----
 
-# -- Physical clamp (JIT/vmap safe) -------------------------------------------
-
-def _clamp_physical_v4(x: jax.Array) -> jax.Array:
-    """Clamp V4.0 state to physiological bounds. Used post-predict on sigma points."""
-    return jnp.stack([
-        jnp.maximum(x[IDX_ATP],      jnp.float32(0.0)),            # ATP >= 0
-        jnp.maximum(x[IDX_CA],       jnp.float32(0.0)),            # Ca >= 0
-        jnp.clip(x[IDX_R1], jnp.float32(0.0), jnp.float32(1.0)),  # R1 in [0,1]
-        jnp.clip(x[IDX_R2], jnp.float32(0.0), jnp.float32(1.0)),  # R2 in [0,1]
-        jnp.maximum(x[IDX_RYR1],     jnp.float32(0.0)),            # RyR1 >= 0
-        jnp.maximum(x[IDX_GLYCOGEN], jnp.float32(0.0)),            # Glycogen >= 0
-    ])
+_VAR_FLOOR: jax.Array = jnp.array([
+    1.0e-4,   # ATP      (0.01 mmol/kg)^2
+    1.0e-4,   # Ca       (0.01 uM)^2
+    1.0e-6,   # R1       (0.001)^2
+    1.0e-6,   # R2       (0.001)^2
+    1.0e-6,   # RyR1     (0.001)^2
+    1.0e-2,   # Glycogen (0.1 mmol/kg)^2
+], dtype=jnp.float32)
 
 
 # -- ODE transition (1 minute, Tsit5) ------------------------------------------
@@ -132,11 +122,7 @@ def _integrate_1min(
     u:      jax.Array,
     params: NMv4Params,
 ) -> jax.Array:
-    """
-    Advance one sigma point by 1 minute via Tsit5.
-
-    vmap-safe: only x varies across sigma points.
-    """
+    """Advance one sigma point by 1 minute via Tsit5. vmap-safe."""
     sol = diffrax.diffeqsolve(
         terms     = diffrax.ODETerm(nm_v4_ode),
         solver    = diffrax.Tsit5(),
@@ -148,12 +134,71 @@ def _integrate_1min(
         saveat    = diffrax.SaveAt(t1=True),
         max_steps = 32,
     )
-    return _clamp_physical_v4(sol.ys[0])
+    return sol.ys[0]
+
+
+# -- Physical clamp (vmap safe) ------------------------------------------------
+
+def _clamp_physical_v4(x: jax.Array) -> jax.Array:
+    """Clamp V4 state to physiological bounds. Used on sigma points post-ODE."""
+    return jnp.stack([
+        jnp.maximum(x[IDX_ATP],      jnp.float32(0.0)),
+        jnp.maximum(x[IDX_CA],       jnp.float32(0.0)),
+        jnp.clip(x[IDX_R1], jnp.float32(0.0), jnp.float32(1.0)),
+        jnp.clip(x[IDX_R2], jnp.float32(0.0), jnp.float32(1.0)),
+        jnp.maximum(x[IDX_RYR1],     jnp.float32(0.0)),
+        jnp.maximum(x[IDX_GLYCOGEN], jnp.float32(0.0)),
+    ])
+
+
+# -- Truncated-normal physical clamps (Simon 2010) ----------------------------
+
+def _apply_physical_clamps(
+    mean: jax.Array,
+    cov:  jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """
+    Gaussian-coherent physical clamping (Simon 2010 truncated-normal).
+
+    Step 1 -- truncated-normal moment matching per constrained dimension:
+        ATP          >= 0  mmol/kg
+        Ca           >= 0  uM
+        R1           in [0, 1]
+        R2           in [0, 1]
+        RyR1_Damage  >= 0
+        Glycogen     >= 0  mmol/kg
+
+    Step 2 -- variance floor (Simon 2010 Section 5.4).
+    Step 3 -- nearest_psd repair (Higham 1988).
+    """
+    m, v = lower_clamp_moments(mean[IDX_ATP],      cov[IDX_ATP,      IDX_ATP],      0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_ATP, m, v)
+
+    m, v = lower_clamp_moments(mean[IDX_CA],       cov[IDX_CA,       IDX_CA],       0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_CA, m, v)
+
+    m, v = range_clamp_moments(mean[IDX_R1],       cov[IDX_R1,       IDX_R1],       0.0, 1.0)
+    mean, cov = clamp_dim(mean, cov, IDX_R1, m, v)
+
+    m, v = range_clamp_moments(mean[IDX_R2],       cov[IDX_R2,       IDX_R2],       0.0, 1.0)
+    mean, cov = clamp_dim(mean, cov, IDX_R2, m, v)
+
+    m, v = lower_clamp_moments(mean[IDX_RYR1],     cov[IDX_RYR1,     IDX_RYR1],     0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_RYR1, m, v)
+
+    m, v = lower_clamp_moments(mean[IDX_GLYCOGEN], cov[IDX_GLYCOGEN, IDX_GLYCOGEN], 0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_GLYCOGEN, m, v)
+
+    cov = variance_floor(cov, _VAR_FLOOR)
+    cov = nearest_psd(cov)
+
+    return mean, cov
 
 
 # -- UKF predict step ----------------------------------------------------------
 
-def _ukf_predict_v4(
+@jax.jit
+def _ukf_predict_nm_v4(
     mean:   jax.Array,
     cov:    jax.Array,
     u:      jax.Array,
@@ -161,10 +206,10 @@ def _ukf_predict_v4(
     Q:      jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
     """
-    UKF predict step: unscented transform through the 1-minute ODE.
+    UKF predict step: eigh-based sigma points through the 1-minute ODE.
 
-    Jitter: chol(_N_LAMBDA * P + _JITTER * I) for numerical stability.
-    Clamp: each propagated sigma point is clamped to physical bounds.
+    Uses shared sigma_points() (PSD-robust eigh) instead of the old Cholesky
+    path. Physical clamp applied to each propagated sigma point post-ODE.
 
     Parameters
     ----------
@@ -178,31 +223,19 @@ def _ukf_predict_v4(
     -------
     (mean_pred, cov_pred)
     """
-    # Cholesky with jitter for numerical safety
-    P_scaled = jnp.float32(_N_LAMBDA) * cov \
-             + jnp.float32(_JITTER) * jnp.eye(_N, dtype=jnp.float32)
-    L        = jnp.linalg.cholesky(P_scaled)   # (N, N) lower triangular
-
-    # 2n+1 sigma points: x0, x0+L.T[i], x0-L.T[i]
-    sp_pos  = mean[None, :] + L.T   # (N, N) = (6, 6)
-    sp_neg  = mean[None, :] - L.T   # (N, N) = (6, 6)
-    sigmas  = jnp.concatenate([mean[None, :], sp_pos, sp_neg], axis=0)  # (13, 6)
-
-    # Propagate all 13 sigma points through ODE (vmap)
-    sigmas_f = jax.vmap(lambda x_i: _integrate_1min(x_i, u, params))(sigmas)  # (13, 6)
-
-    # Weighted mean and covariance
-    mean_pred = jnp.einsum("i,is->s", _WM, sigmas_f)
-    diff      = sigmas_f - mean_pred[None, :]
-    P_pred    = jnp.einsum("i,is,it->st", _WC, diff, diff) + Q
-    P_pred    = jnp.float32(0.5) * (P_pred + P_pred.T)
-
-    return mean_pred, P_pred
+    pts        = sigma_points(mean, cov, _LAM)                         # (13, 6)
+    pts_next   = jax.vmap(
+        _integrate_1min, in_axes=(0, None, None)
+    )(pts, u, params)                                                   # (13, 6)
+    pts_next   = jax.vmap(_clamp_physical_v4)(pts_next)                # clamp sigma pts
+    mean_pred, cov_pred = unscented_transform(pts_next, Q, _WM, _WC)
+    return mean_pred, cov_pred
 
 
 # -- UKF update step -----------------------------------------------------------
 
-def _ukf_update_v4(
+@jax.jit
+def _ukf_update_nm_v4(
     mean_pred:  jax.Array,
     cov_pred:   jax.Array,
     y_obs:      jax.Array,
@@ -213,8 +246,7 @@ def _ukf_update_v4(
     """
     UKF measurement update: [EMG_mV, SmO2_pct].
 
-    Floor diagonal at 1e-3 post-update for variance stability.
-    Physical clamp applied to posterior mean.
+    Uses eigh-based sigma_points() for the update step.
 
     Parameters
     ----------
@@ -229,37 +261,22 @@ def _ukf_update_v4(
     -------
     (posterior_mean, posterior_cov)
     """
-    # Sigma points from predicted distribution
-    P_scaled = jnp.float32(_N_LAMBDA) * cov_pred \
-             + jnp.float32(_JITTER) * jnp.eye(_N, dtype=jnp.float32)
-    L        = jnp.linalg.cholesky(P_scaled)
-    sp_pos   = mean_pred[None, :] + L.T
-    sp_neg   = mean_pred[None, :] - L.T
-    sigmas   = jnp.concatenate([mean_pred[None, :], sp_pos, sp_neg], axis=0)   # (13, 6)
+    pts    = sigma_points(mean_pred, cov_pred, _LAM)                   # (13, 6)
+    y_pts  = jax.vmap(
+        lambda x_i: h_nm_v4(x_i, obs_params, nm_params)
+    )(pts)                                                              # (13, 2)
 
-    # Observation predictions for each sigma point
-    y_sigma = jax.vmap(lambda x_i: h_nm_v4(x_i, obs_params, nm_params))(sigmas)  # (13, 2)
+    y_mean = jnp.einsum("i,ij->j", _WM, y_pts)                        # (2,)
+    dy     = y_pts - y_mean[None, :]                                   # (13, 2)
+    dx     = pts   - mean_pred[None, :]                                # (13, 6)
 
-    y_mean = jnp.einsum("i,io->o", _WM, y_sigma)
-    dy_s   = y_sigma - y_mean[None, :]
-    dx_s   = sigmas  - mean_pred[None, :]
+    S_yy   = jnp.einsum("i,ij,ik->jk", _WC, dy, dy) + R              # (2, 2)
+    P_xy   = jnp.einsum("i,ij,ik->jk", _WC, dx, dy)                  # (6, 2)
 
-    S_yy = jnp.einsum("i,io,ij->oj", _WC, dy_s, dy_s) + R   # (OBS_DIM, OBS_DIM)
-    P_xy = jnp.einsum("i,is,io->so", _WC, dx_s, dy_s)       # (STATE_DIM, OBS_DIM)
-
-    K         = P_xy @ jnp.linalg.inv(S_yy)
-    innov     = y_obs - y_mean
-    post_mean = mean_pred + K @ innov
-    post_cov  = cov_pred  - K @ S_yy @ K.T
-    post_cov  = jnp.float32(0.5) * (post_cov + post_cov.T)
-
-    # Floor diagonal at 1e-3 (prevents variance collapse)
-    idx      = jnp.arange(_N)
-    floored  = jnp.maximum(jnp.diag(post_cov), jnp.float32(1e-3))
-    post_cov = post_cov.at[idx, idx].set(floored)
-
-    # Physical clamp on posterior mean
-    post_mean = _clamp_physical_v4(post_mean)
+    K          = P_xy @ jnp.linalg.inv(S_yy)                          # (6, 2)
+    innov      = y_obs - y_mean                                        # (2,)
+    post_mean  = mean_pred + K @ innov
+    post_cov   = cov_pred  - K @ S_yy @ K.T
 
     return post_mean, post_cov
 
@@ -273,8 +290,9 @@ class NMv4Filter:
     Assimilates [EMG_Amplitude_mV, SmO2_pct] at 1-minute intervals to infer the
     6 hidden physiological states [ATP, Ca, R1, R2, RyR1_Damage, Muscle_Glycogen].
 
-    UKF parameters: alpha=0.10 (MANDATORY), n=6 -> 13 sigma points.
-    Jitter=1e-3, clamp post-predict, floor diagonal 1e-3 post-update.
+    UKF V4.1: uses canonical eigh-based sigma_points(), nearest_psd(),
+    variance_floor(), and truncated-normal moment matching (Simon 2010).
+    Same gold standard as the Cardiorespiratory filter.
 
     Fail-Loud contract
     ------------------
@@ -303,7 +321,10 @@ class NMv4Filter:
         quality_flags: tuple[int, int] = (0, 0),
     ) -> GaussianState:
         """
-        Full UKF cycle: 1-min Tsit5 ODE predict -> 2-channel observation update.
+        Full UKF cycle (Truncated UKF, Simon 2010):
+            1. Predict: eigh sigma_points -> 1-min Tsit5 ODE -> unscented_transform
+            2. Update:  eigh sigma_points -> h_nm_v4 -> Kalman gain
+            3. Clamp:   truncated-normal moment matching + variance_floor + nearest_psd
 
         Parameters
         ----------
@@ -322,8 +343,8 @@ class NMv4Filter:
         RuntimeError on NaN posterior mean.
         RuntimeError on negative diagonal covariance.
         """
-        # -- Predict step ------------------------------------------------------
-        mean_pred, cov_pred = _ukf_predict_v4(
+        # -- Predict step (eigh sigma points) ----------------------------------
+        mean_pred, cov_pred = _ukf_predict_nm_v4(
             prior.mean, prior.cov, u, self.nm_params, self.Q
         )
 
@@ -334,7 +355,7 @@ class NMv4Filter:
 
         R_step = inflate_R_nm_v4((flags[0], flags[1]), self.R)
 
-        # Substitute NaN observations with predicted values (no information added)
+        # Substitute NaN observations with predicted values
         y_hat = h_nm_v4(mean_pred, self.obs_params, self.nm_params)
         y_obs = jnp.array([
             y_hat[0] if flags[0] == 4 else float(emg_mV),
@@ -342,9 +363,12 @@ class NMv4Filter:
         ], dtype=jnp.float32)
 
         # -- Update step -------------------------------------------------------
-        post_mean, post_cov = _ukf_update_v4(
+        post_mean, post_cov = _ukf_update_nm_v4(
             mean_pred, cov_pred, y_obs, self.obs_params, self.nm_params, R_step
         )
+
+        # -- Truncated UKF clamps (Simon 2010) ---------------------------------
+        post_mean, post_cov = _apply_physical_clamps(post_mean, post_cov)
 
         # -- Fail-Loud checks --------------------------------------------------
         if bool(jnp.any(jnp.isnan(post_mean))):

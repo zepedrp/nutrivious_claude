@@ -1,33 +1,33 @@
 """
-app/slices/metabolic_glucose/filter.py -- UKF State Filter V2.0
+app/slices/metabolic_glucose/filter.py -- UKF State Filter V3.0
 
-L4 Unscented Kalman Filter for the 6-state Metabolic Glucose slice.
+L4 Unscented Kalman Filter for the 5-state Metabolic Glucose slice (V3.0).
+Refactored to use canonical UKF primitives from app.engine.assimilation.ukf_filter,
+eliminating the local Cholesky-fragile sigma-point path.
 
-UKF parametrisation (Merwe & Wan 2000)
-───────────────────────────────────────
-    alpha = 0.10   MANDATORY -- prevents float32 catastrophic cancellation.
-                   At alpha=1e-3: (N+lambda) = N*alpha^2 = 6e-6 (near-zero
-                   sigma spread, float32 unstable). At alpha=0.10:
-                   lambda = 0.01*6 - 6 = -5.94; (N+lambda) = 0.06  STABLE.
-    beta  = 2.0    optimal for Gaussian distributions
-    kappa = 0.0
-    lambda = alpha^2*(N+kappa) - N = -5.94
-    (N+lambda) = 0.06  -> sigma spread = sqrt(0.06*P), above float32 floor
-
-State N=6: [G, I, Gc, LG, MG, Lac]  -> 13 sigma points
+State N=5: [G, I, Gc, LG, Lac]  -> 2*5+1 = 11 sigma points
 Observation: y = [G_obs mg/dL]  (CGM, scalar)
 Transition: 1-min ODE via diffrax.Tsit5
 
-MANDATORY post-update:
-    posterior_mean = jnp.maximum(posterior_mean, 0)
-    cov = 0.5*(cov + cov.T) + 1e-3 * I   (symmetrise + jitter for PSD)
+UKF parametrisation (Merwe & Wan 2000)
+  alpha = 0.10  float32-safe (Wm[0] = 1 - 1/alpha^2 = -99.0, n-independent)
+  beta  = 2.0
+  kappa = 0.0
+  lambda = alpha^2*(N+kappa) - N = 0.01*5 - 5 = -4.95
+  (N+lambda) = 0.05 -> sigma spread = sqrt(0.05*P), above float32 floor
+
+Post-update (Truncated UKF, Simon 2010):
+    clamp non-negative  (jnp.maximum(x, 0))
+    variance_floor      (prevents over-confidence)
+    nearest_psd         (Higham 1988 eigh repair)
 
 Fail-Loud:
     NaN in posterior_mean -> RuntimeError
 
 References:
     Merwe & Wan (2000) Proc. ASSPCC
-    Dalla Man et al. (2007) IEEE TBME 54:1740-1749
+    Simon D. (2010) Optimal State Estimation, Wiley
+    Higham N.J. (1988) Linear Algebra Appl. 103:103-118
 """
 from __future__ import annotations
 
@@ -37,7 +37,14 @@ import jax
 import jax.numpy as jnp
 import diffrax
 
-from app.engine.assimilation.ukf_filter import GaussianState
+from app.engine.assimilation.ukf_filter import (
+    GaussianState,
+    ukf_weights,
+    sigma_points,
+    unscented_transform,
+    nearest_psd,
+    variance_floor,
+)
 from app.slices.metabolic_glucose.ode import (
     metabolic_glucose_ode,
     GlucoseMetabParams,
@@ -56,21 +63,14 @@ from app.slices.metabolic_glucose.observation import (
 
 logger = logging.getLogger(__name__)
 
-# -- UKF weights (alpha=0.10, beta=2.0, kappa=0.0, N=6)
-_ALPHA: float = 0.10   # MANDATORY: prevents float32 cancellation at N=6
+# -- UKF weights (alpha=0.10, N=STATE_DIM=5)
+_ALPHA: float = 0.10
 _BETA:  float = 2.0
 _KAPPA: float = 0.0
-_N:     int   = STATE_DIM   # 6
+_N:     int   = STATE_DIM   # 5 after V3.0
 
-_LAM: float = _ALPHA ** 2 * (_N + _KAPPA) - _N   # = 0.01*6 - 6 = -5.94
-_NL:  float = _N + _LAM                           # = 0.06
-
-_WM_0: float = _LAM / _NL                         # = -99.0
-_WC_0: float = _WM_0 + 1.0 - _ALPHA ** 2 + _BETA  # = -96.01
-_WI:   float = 0.5 / _NL                          # = 8.333...
-
-_WM: jax.Array = jnp.array([_WM_0] + [_WI] * (2 * _N), dtype=jnp.float32)
-_WC: jax.Array = jnp.array([_WC_0] + [_WI] * (2 * _N), dtype=jnp.float32)
+_WM, _WC, _LAM = ukf_weights(_N, _ALPHA, _BETA, _KAPPA)
+# lambda = -4.95; (N+lambda) = 0.05; Wm[0] = -99.0; Wi = 0.5/0.05 = 10.0
 
 # -- Process noise Q (per 1-min step, dt_minutes=1.0)
 _Q_DIAG: jax.Array = jnp.array([
@@ -78,11 +78,19 @@ _Q_DIAG: jax.Array = jnp.array([
     0.25,    # I   [pmol/L]^2   insulin pulse variability
     1.00,    # Gc  [pg/mL]^2    glucagon pulse variability
     0.010,   # LG  [g]^2        slow hepatic dynamics
-    0.010,   # MG  [g]^2        slow muscle glycogen dynamics
     0.001,   # Lac [mmol/L]^2   slow lactate variability
 ], dtype=jnp.float32)
 
 Q_DEFAULT: jax.Array = jnp.diag(_Q_DIAG)
+
+# -- Simon 2010 variance floor (post-update minimum variance per dimension)
+_VAR_FLOOR: jax.Array = jnp.array([
+    1.0e-2,   # G   (0.1 mg/dL)^2
+    1.0e-2,   # I   (0.1 pmol/L)^2
+    1.0e-2,   # Gc  (0.1 pg/mL)^2
+    1.0e-4,   # LG  (0.01 g)^2
+    1.0e-4,   # Lac (0.01 mmol/L)^2
+], dtype=jnp.float32)
 
 
 def _integrate_1min(
@@ -90,7 +98,7 @@ def _integrate_1min(
     hubs:   jax.Array,
     params: GlucoseMetabParams,
 ) -> jax.Array:
-    """Advance the 6-state glucose ODE by dt_minutes=1.0 minute via Tsit5."""
+    """Advance the 5-state glucose ODE by dt_minutes=1.0 minute via Tsit5."""
     sol = diffrax.diffeqsolve(
         terms    = diffrax.ODETerm(metabolic_glucose_ode),
         solver   = diffrax.Tsit5(),
@@ -105,34 +113,16 @@ def _integrate_1min(
     return sol.ys[0]
 
 
-def _sigma_points(mean: jax.Array, cov: jax.Array) -> jax.Array:
-    """
-    Merwe-Wan sigma points: sigma_0 = mu; sigma_i = mu +/- L.T[i-1]
-    where L = chol((N+lambda) * Sigma). Returns (2N+1, STATE_DIM).
-    """
-    L   = jnp.linalg.cholesky(_NL * cov)
-    pos = mean[None, :] + L.T
-    neg = mean[None, :] - L.T
-    return jnp.concatenate([mean[None, :], pos, neg], axis=0)
-
-
-def _recover_mean_cov(
-    pts: jax.Array,
-    Q:   jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    """Recover (mean, cov) from propagated sigma points + process noise Q."""
-    mean = jnp.einsum("i,ij->j", _WM, pts)
-    diff = pts - mean[None, :]
-    cov  = jnp.einsum("i,ij,ik->jk", _WC, diff, diff) + Q
-    return mean, cov
-
-
 class MetabolicGlucoseFilter:
     """
-    L4 Unscented Kalman Filter -- 6-state Metabolic Glucose slice.
+    L4 Unscented Kalman Filter -- 5-state Metabolic Glucose slice V3.0.
 
-    Infers plasma glucose, insulin, glucagon, liver/muscle glycogen, and lactate
+    Infers plasma glucose, insulin, glucagon, liver glycogen, and lactate
     from the scalar CGM signal at 1-minute (dt_minutes=1.0) resolution.
+
+    Uses canonical UKF primitives (eigh-based sigma points, nearest_psd,
+    variance_floor) from app.engine.assimilation.ukf_filter -- same gold
+    standard as the Cardiorespiratory slice.
 
     Usage
     ─────
@@ -164,18 +154,18 @@ class MetabolicGlucoseFilter:
         quality_flag: int = 0,
     ) -> GaussianState:
         """
-        Assimilate one 1-minute CGM reading into the 6-state estimate.
+        Assimilate one 1-minute CGM reading into the 5-state estimate.
 
-        Steps:
-            1. Predict -- propagate prior through 1-min ODE (sigma points)
-            2. Update  -- correct with CGM observation (quality-flag-aware R)
-            3. Post    -- clamp jnp.maximum(x, 0); symmetrise cov; add 1e-3 jitter
+        Steps (Truncated UKF, Simon 2010):
+            1. Predict -- sigma_points(eigh) -> vmap ODE -> unscented_transform
+            2. Update  -- sigma_points(eigh) -> h_cgm -> Kalman gain
+            3. Post    -- non-negative clamp; variance_floor; nearest_psd
 
         Parameters
         ----------
         prior        : GaussianState(mean, cov)
         cgm_reading  : float [mg/dL]; NaN -> predict-only step
-        hubs         : (HUB_DIM,); defaults to HUBS_DEFAULT
+        hubs         : (HUB_DIM=5,); defaults to HUBS_DEFAULT
         params       : GlucoseMetabParams; defaults to DEFAULT_PARAMS
         quality_flag : int in [0, 4]; 4 = missing -> R * 1e8
 
@@ -192,28 +182,28 @@ class MetabolicGlucoseFilter:
         if params is None:
             params = DEFAULT_PARAMS
 
-        # Predict step: propagate prior sigma points through 1-min ODE
-        sigma      = _sigma_points(prior.mean, prior.cov)        # (2N+1, N)
-        sigma_next = jax.vmap(
+        # -- Predict step (eigh-based sigma points) ----------------------------
+        pts_prior  = sigma_points(prior.mean, prior.cov, _LAM)     # (11, 5)
+        pts_next   = jax.vmap(
             _integrate_1min, in_axes=(0, None, None)
-        )(sigma, hubs, params)                                    # (2N+1, N)
-        mean_pred, cov_pred = _recover_mean_cov(sigma_next, self.Q)
+        )(pts_prior, hubs, params)                                  # (11, 5)
+        mean_pred, cov_pred = unscented_transform(pts_next, self.Q, _WM, _WC)
 
-        # Update step: correct with CGM (quality-flag-aware R inflation)
-        R_step = inflate_R_for_quality(quality_flag, self.R)
+        # -- Update step -------------------------------------------------------
+        R_step     = inflate_R_for_quality(quality_flag, self.R)
+        cgm_is_nan = cgm_reading != cgm_reading
 
-        cgm_is_nan = cgm_reading != cgm_reading   # NaN check
         if cgm_is_nan:
             posterior_mean = mean_pred
             posterior_cov  = cov_pred
         else:
             y_obs   = jnp.array([float(cgm_reading)], dtype=jnp.float32)
-            sigma_u = _sigma_points(mean_pred, cov_pred)
-            y_sigma = h_cgm_sigma(sigma_u)                        # (2N+1, 1)
+            pts_upd = sigma_points(mean_pred, cov_pred, _LAM)      # (11, 5)
+            y_sigma = h_cgm_sigma(pts_upd)                         # (11, 1)
 
             y_mean = jnp.einsum("i,ij->j", _WM, y_sigma)
             dy_s   = y_sigma - y_mean[None, :]
-            dx_s   = sigma_u - mean_pred[None, :]
+            dx_s   = pts_upd - mean_pred[None, :]
 
             S_yy = jnp.einsum("i,ij,ik->jk", _WC, dy_s, dy_s) + R_step
             P_xy = jnp.einsum("i,ij,ik->jk", _WC, dx_s, dy_s)
@@ -223,16 +213,17 @@ class MetabolicGlucoseFilter:
             posterior_mean = mean_pred + K @ innovation
             posterior_cov  = cov_pred - K @ S_yy @ K.T
 
-        # MANDATORY: clamp concentrations to non-negative
+        # -- Post-update: Truncated UKF (Simon 2010) ---------------------------
+        # Clamp all concentrations to non-negative (physical lower bound)
         posterior_mean = jnp.maximum(posterior_mean, jnp.float32(0.0))
 
-        # Symmetrise + 1e-3 jitter on diagonal (guarantees PSD)
-        posterior_cov = 0.5 * (posterior_cov + posterior_cov.T)
-        posterior_cov = posterior_cov + jnp.float32(1e-3) * jnp.eye(
-            STATE_DIM, dtype=jnp.float32
-        )
+        # Variance floor: prevent over-confidence after truncated-normal contraction
+        posterior_cov = variance_floor(posterior_cov, _VAR_FLOOR)
 
-        # Fail-Loud: divergence detection
+        # PSD repair via eigendecomposition (Higham 1988)
+        posterior_cov = nearest_psd(posterior_cov)
+
+        # -- Fail-Loud: divergence detection -----------------------------------
         if bool(jnp.any(jnp.isnan(posterior_mean))):
             raise RuntimeError(
                 "MetabolicGlucoseFilter.update_state: posterior_mean contains NaN. "

@@ -33,8 +33,10 @@ For each day D (chronological, after a warm-up window):
        At wake_hour=08:00 this gives a 13% boost to vagal reactivation rate.
 
   3. PREDICTION:
-     predicted_rmssd_ms = clip(AT_0800, 0, 1) * RMSSD_ref_ms
+     predicted_rmssd_ms = RMSSD_load_7d(08:00) * AT_0800
      predicted_target   = ln(max(predicted_rmssd_ms, 1.0))
+     where AT_0800 may exceed 1.0 by circadian amplitude (Fix 4 -- Borbely boost),
+     and RMSSD_load_7d is seeded with the personal RMSSD_ref_ms from warmup (Fix 3).
 
   4. GROUND TRUTH:
      RMSSD_obs_ms record in day D+1 within +/- 2h window around 08:00.
@@ -96,6 +98,7 @@ from app.slices.cardiorespiratory.ode import (
     X0_CARDIO_DEFAULT,
     P0_CARDIO_DEFAULT,
     IDX_AT,
+    IDX_RMSSD7D,
 )
 from app.slices.cardiorespiratory.filter import (
     CardioStateFilter,
@@ -304,6 +307,20 @@ def _blind_overnight_predict(
         current = GaussianState(mean=m, cov=c)
         elapsed += step
 
+    # Circadian amplitude boost: AT equilibrium under sleep is 1.0 + amplitude
+    # (Borbely two-process: Process C pushes vagal tone above daytime baseline
+    # near SCN peak; the ODE alone cannot exceed 1.0 because its recovery term
+    # is anchored at 1.0, so we apply the circadian offset post-integration).
+    _amp = _circ - 1.0   # e.g., 0.13 at wake_hour=08:00
+    new_at = jnp.minimum(
+        current.mean[IDX_AT] + jnp.float32(_amp),
+        jnp.float32(1.0 + _amp),    # AT_max = 1.0 + circadian_amplitude
+    )
+    current = GaussianState(
+        mean=current.mean.at[IDX_AT].set(new_at),
+        cov=current.cov,
+    )
+
     return current
 
 
@@ -493,11 +510,34 @@ class InterDayTwinValidator:
         ewma = LogRMSSDEWMA()
         preds: list[DayPrediction] = []
 
+        warmup_rmssd_ms: list[float] = []  # morning RMSSD obs during warmup
+        _calibrated = False
+
         for day_idx in sorted(by_day.keys()):
             day_recs = sorted(by_day[day_idx], key=lambda r: r["timestamp_min"])
 
             # Update baselines with THIS day's morning RMSSD observation
             today_ln = _find_morning_rmssd_ln(by_day, day_idx, t0)
+
+            # Collect warmup RMSSD observations for personal calibration
+            if day_idx < self._warmup and today_ln is not None:
+                warmup_rmssd_ms.append(math.exp(today_ln))
+
+            # Personal RMSSD_ref_ms calibration at warmup boundary (Fix 3)
+            # Replaces population default (35 ms) with the athlete's own baseline.
+            if day_idx == self._warmup and not _calibrated:
+                if warmup_rmssd_ms:
+                    personal_ms = float(np.median(warmup_rmssd_ms))
+                    personal_ms = max(5.0, personal_ms)   # sanity floor
+                    self._params = self._params._replace(
+                        cardio=self._params.cardio._replace(RMSSD_ref_ms=personal_ms)
+                    )
+                    logger.info(
+                        "RMSSD_ref_ms personalised: %.1f ms (n=%d warmup mornings)",
+                        personal_ms, len(warmup_rmssd_ms),
+                    )
+                _calibrated = True
+
             if today_ln is not None:
                 ewma.update(today_ln)
                 persist_ln = today_ln
@@ -513,11 +553,14 @@ class InterDayTwinValidator:
                 wake_hour=self._wake_hour,
             )
 
-            # 3. Predicted RMSSD via Autonomic_Tone(08:00)
-            at_0800    = float(jnp.clip(state_0800.mean[IDX_AT], 0.0, 1.0))
-            rmssd_ref  = float(self._params.cardio.RMSSD_ref_ms)
-            pred_rmssd = max(at_0800 * rmssd_ref, 1.0)
-            pred_ln    = math.log(pred_rmssd)
+            # 3. Predicted RMSSD: RMSSD_load_7d(08:00) * AT(08:00) (Fix 2)
+            # RMSSD_load_7d is the 7-day chronic load state (ms); AT is the daily
+            # vagal modulator [0, 1+circadian_amplitude] -- their product predicts
+            # next-morning RMSSD anchored to both chronic load and acute recovery.
+            rmssd_load_7d = float(state_0800.mean[IDX_RMSSD7D])
+            at_0800       = float(jnp.clip(state_0800.mean[IDX_AT], 0.0, 2.0))
+            pred_rmssd    = max(rmssd_load_7d * at_0800, 1.0)
+            pred_ln       = math.log(pred_rmssd)
 
             # 4. Ground truth: next morning RMSSD
             obs_ln = _find_morning_rmssd_ln(by_day, day_idx + 1, t0)

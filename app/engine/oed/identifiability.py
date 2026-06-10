@@ -13,10 +13,11 @@ y_t_obs ~ N(y_t, R), the Fisher Information Matrix (FIM) at parameter point thet
 where J_t = dy_t/d(theta) is the sensitivity matrix (Jacobian of the observation
 map with respect to the parameters at time t).
 
-Sensitivities are computed via jax.jacfwd (forward-mode automatic differentiation),
-which is exact (not finite-difference) and JIT-traceable. Forward-mode AD is preferred
-over reverse-mode here because D << T (few parameters, many time steps), making
-JVP-based (forward) computation more efficient than VJP-based (reverse).
+Sensitivities are computed via jax.jacrev (reverse-mode automatic differentiation),
+which is exact (not finite-difference) and JIT-traceable. Reverse-mode AD is required
+because diffrax.RecursiveCheckpointAdjoint only checkpoints VJP (reverse) passes;
+using jacfwd bypasses the checkpoint and triggers catastrophic O(T) memory unroll
+on long or stiff trajectories.
 
 Identifiability Criterion
 --------------------------
@@ -37,8 +38,8 @@ This is the scalar metric used by OEDProtocolGenerator to rank candidate protoco
 Compatibility
 -------------
 - Pure JAX: all array operations are JIT-traceable and vmap-safe.
-- jax.jacfwd traces through jax.lax.scan and diffrax.diffeqsolve (which uses
-  jax.lax.while_loop). Both support forward-mode JVP in JAX >= 0.4.
+- jax.jacrev traces through jax.lax.scan and diffrax.diffeqsolve (which uses
+  jax.lax.while_loop + RecursiveCheckpointAdjoint). Both support VJP in JAX >= 0.4.
 - If a slice uses a non-differentiable op, provide a simplified forward_fn
   (e.g., fixed-step RK4) instead of the production diffrax solver.
 
@@ -114,7 +115,7 @@ def compute_fim(
     R_inv:      object,
 ) -> jax.Array:
     """
-    Compute FIM = sum_t J_t^T @ R^{-1} @ J_t via jax.jacfwd.
+    Compute FIM = sum_t J_t^T @ R^{-1} @ J_t via jax.jacrev.
 
     Parameters
     ----------
@@ -131,7 +132,7 @@ def compute_fim(
 
     Notes
     -----
-    J = jax.jacfwd(forward_fn)(theta) has shape:
+    J = jax.jacrev(forward_fn)(theta) has shape:
         (T, D)          if forward_fn returns (T,)
         (T, obs_dim, D) if forward_fn returns (T, obs_dim)
 
@@ -139,7 +140,7 @@ def compute_fim(
     FIM for vector obs: einsum("tij,il,tlk->jk", J, R_inv, J)
         which equals sum_t J_t.T @ R_inv @ J_t for each t.
     """
-    J = jax.jacfwd(forward_fn)(theta)
+    J = jax.jacrev(forward_fn)(theta)
 
     if J.ndim == 2:
         # J: (T, D) -- scalar observation channel

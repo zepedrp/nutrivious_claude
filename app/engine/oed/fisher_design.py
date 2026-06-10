@@ -130,23 +130,35 @@ class OEDProtocolGenerator:
 
     def evaluate_protocol(
         self,
-        protocol: jax.Array,
-        x0:       jax.Array,
+        protocol:      jax.Array,
+        x0:            jax.Array,
+        theta_current: jax.Array | None = None,
     ) -> FIMResult:
         """
-        Evaluate FIM for a single protocol at the config's theta_prior.
+        Evaluate FIM for a single protocol.
 
         Parameters
         ----------
-        protocol : (T,) -- power time-series [W] for this candidate.
-        x0       : (STATE_DIM,) -- initial physiological state.
+        protocol      : (T,) -- power time-series [W] for this candidate.
+        x0            : (STATE_DIM,) -- initial physiological state.
+        theta_current : (D,) optional -- current posterior log-theta (UKF estimate).
+                        When supplied, the FIM is linearised here instead of the
+                        static population prior, making OED adaptive to the individual.
+                        Pass the UKF's current log-parameter posterior after each
+                        NLME update cycle to achieve per-session adaptive OED.
+                        When None, falls back to config.theta_prior (population mean).
 
         Returns
         -------
         FIMResult
         """
+        theta_eval = (
+            jnp.asarray(theta_current, dtype=jnp.float32)
+            if theta_current is not None
+            else self.config.theta_prior
+        )
         forward_fn = self.forward_factory(x0, protocol)
-        fim = compute_fim(forward_fn, self.config.theta_prior, self.config.R_inv)
+        fim = compute_fim(forward_fn, theta_eval, self.config.R_inv)
         return analyze_fim(
             fim,
             list(self.config.param_names),
@@ -155,17 +167,23 @@ class OEDProtocolGenerator:
 
     def select_optimal(
         self,
-        candidates: dict,
-        x0:         jax.Array,
+        candidates:    dict,
+        x0:            jax.Array,
+        theta_current: jax.Array | None = None,
     ) -> OEDAction:
         """
         Evaluate all candidates and return the D-optimal OEDAction.
 
         Parameters
         ----------
-        candidates : dict[str, jax.Array]
+        candidates    : dict[str, jax.Array]
             Candidate protocols: name -> power_profile (T,).
-        x0         : (STATE_DIM,) -- initial state.
+        x0            : (STATE_DIM,) -- initial state.
+        theta_current : (D,) optional -- current posterior log-theta from UKF/NLME.
+                        Enables adaptive (local) FIM evaluation at the individual's
+                        current parameter estimate rather than the population prior.
+                        Re-evaluate on every OED call after a new NLME update to
+                        track the shifting Fisher geometry as the Twin learns.
 
         Returns
         -------
@@ -180,7 +198,11 @@ class OEDProtocolGenerator:
 
         all_results: dict[str, FIMResult] = {}
         for name, protocol in candidates.items():
-            result = self.evaluate_protocol(jnp.asarray(protocol, dtype=jnp.float32), x0)
+            result = self.evaluate_protocol(
+                jnp.asarray(protocol, dtype=jnp.float32),
+                x0,
+                theta_current=theta_current,
+            )
             all_results[name] = result
             logger.debug(
                 "OED candidate %-20s | log det(FIM)=%+.2f | cond=%6.1e | unid=%s",

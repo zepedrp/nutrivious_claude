@@ -173,8 +173,9 @@ def simulate_hr_trajectory(
             dt0     = jnp.float32(0.1),
             y0      = x,
             args    = (params_i, power_t, jnp.float32(37.0), jnp.float32(0.0)),
-            saveat  = diffrax.SaveAt(t1=True),
+            saveat    = diffrax.SaveAt(t1=True),
             max_steps = 32,
+            adjoint   = diffrax.RecursiveCheckpointAdjoint(checkpoints=8),
         )
         x_next = sol.ys[0]
         return x_next, x_next[IDX_HR]

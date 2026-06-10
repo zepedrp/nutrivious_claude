@@ -1,77 +1,114 @@
 """
 app/validation/backtest_engine.py
 
-Gate Zero — Walk-Forward Out-of-Sample Validation Harness
+Gate Zero -- Inter-Day HRV Walk-Forward Validation
 
-Criterion (HLD §5, Compass Passo 13)
-──────────────────────────────────────
-The digital twin must beat the 7-day rolling mean (naive baseline) on MAE
-in ≥60% of users at ≥60 days of data.
+Criterion
+---------
+The Digital Twin predicts ln(RMSSD_obs_ms) at 08:00 the following morning.
+It PASSES Gate Zero if its MAE is STRICTLY INFERIOR to BOTH:
 
-    GateZeroDecision.PASS   — twin_beats_baseline in ≥60% users
-    GateZeroDecision.FAIL   — twin_beats_baseline in < 60% users
-    GateZeroDecision.INSUFFICIENT_DATA — < 60 days of data for any user
+    BASELINE 1 -- Persistence:  ln(RMSSD) from yesterday morning
+    BASELINE 2 -- EWMA-7d:      exp-weighted mean (span=7d) of past ln(RMSSD)
 
-Walk-forward protocol
-──────────────────────
-For each user:
-    1. Train on [0, T_train) — fit NLME posterior (or use population prior)
-    2. Test on [T_train, T_train + 60 days) — one-step-ahead prediction
-    3. Baseline: 7-day rolling mean of the training window's HR target
-    4. Twin: UKF predict-step mean at each test step
-    5. Compute MAE(twin) and MAE(baseline) on HR channel
+in >= 60% of users that have >= 60 days of paired predictions.
 
-Data format
-────────────
-Each user's data is a list[dict] of 1-min observation records:
+Walk-Forward Protocol (Inter-Day, per User)
+-------------------------------------------
+For each day D (chronological, after a warm-up window):
+
+  1. DAYTIME ASSIMILATION (00:00 -- last record of day D, variable-rate async UKF):
+     All intra-day records processed with true dt_real between samples.
+     UKF predict + update at each record. RMSSD morning observations, when
+     present in the record stream, are assimilated normally (R-channel inflation
+     for sparse measurements is already handled by CardioStateFilter).
+
+  2. BLIND OVERNIGHT PREDICT (last_record_ts --> 08:00 next day):
+     Starting from the end-of-day posterior, run UKF PREDICT ONLY.
+     Sleep controls: power=0 W, T_core=37.0 C, pv_drop=0 %.
+     Step size: OVERNIGHT_DT_MIN = 10 min (bi-exp W' recovery is slow enough).
+     No measurement update during this segment -- genuine blind forecast.
+
+  3. PREDICTION:
+     predicted_rmssd_ms = clip(AT_0800, 0, 1) * RMSSD_ref_ms
+     predicted_target   = ln(max(predicted_rmssd_ms, 1.0))
+
+  4. GROUND TRUTH:
+     RMSSD_obs_ms record in day D+1 within +/- 2h window around 08:00.
+     observed_target = ln(RMSSD_obs_ms).
+
+  5. BASELINES (computed at prediction time, i.e. state of knowledge at 23:59):
+     Persistence = ln(last observed RMSSD_obs_ms up to and including day D morning)
+     EWMA-7d     = alpha * ln(RMSSD_D_morning) + (1-alpha) * EWMA_{D-1}
+                   with alpha = 2 / (7 + 1) = 0.25
+
+  Gate Criterion:
+     twin_wins_user = MAE_twin < MAE_persistence AND MAE_twin < MAE_ewma7d
+     gate_passes    = fraction(twin_wins_user) >= 0.60 over qualifying users
+
+Data Format (same as previous engine, plus RMSSD_obs_ms is used as morning GT)
+-------------------------------------------------------------------------------
+Records: list[dict] sorted by timestamp_min ascending:
     {
-        "timestamp_min": int,          # minutes since day 0
-        "HR_obs_bpm":    float | None,
-        "VO2_obs":       float | None,
-        "RMSSD_obs_ms":  float | None,
-        "power_watts":   float,        # 0.0 if rest
-        "hub_T_core":    float | None,
-        "hub_pv_drop_pct": float,      # 0.0 if unknown
+        "timestamp_min":    int,           # minutes since cohort day 0
+        "HR_obs_bpm":       float | None,
+        "VO2_obs":          float | None,
+        "RMSSD_obs_ms":     float | None,  # present only for morning (~08:00) records
+        "power_watts":      float,         # 0.0 at rest / sleep
+        "hub_T_core":       float | None,
+        "hub_pv_drop_pct":  float,
     }
 
-Fail-Loud contract
-───────────────────
-RuntimeError if twin produces NaN predictions (filter divergence).
-All exceptions from CardioStateFilter propagate unmodified.
-Empty user data raises ValueError loudly.
+Fail-Loud Contract
+------------------
+RuntimeError if UKF diverges (NaN in posterior mean) -- propagated from filter.
+ValueError for empty user data.
 """
 from __future__ import annotations
 
 import logging
 import math
-from collections import deque
 from enum import Enum
 from typing import NamedTuple
 
 import numpy as np
+import jax.numpy as jnp
 
-from app.engine.assimilation.ukf_filter import GaussianState
+from app.engine.assimilation.ukf_filter import GaussianState, scale_Q
 from app.slices.cardiorespiratory.ode import (
     X0_CARDIO_DEFAULT,
     P0_CARDIO_DEFAULT,
-    IDX_HR,
+    IDX_AT,
 )
 from app.slices.cardiorespiratory.filter import (
     CardioStateFilter,
     CardioTransitionParams,
     DEFAULT_TRANSITION_PARAMS,
+    Q_DEFAULT,
+    _ukf_predict_cardio,
 )
 
 logger = logging.getLogger(__name__)
 
-# Gate Zero criterion (HLD §5)
-_GATE_MIN_DAYS:         int   = 60      # minimum test window [days]
-_GATE_PASS_FRACTION:    float = 0.60   # fraction of users where twin must win
-_ROLLING_WINDOW_DAYS:   int   = 7      # rolling mean baseline window [days]
-_MINS_PER_DAY:          int   = 1440
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_MINS_PER_DAY:       int   = 1440
+_MORNING_TARGET_MIN: int   = 480      # 08:00 in day-local minutes
+_MORNING_WINDOW_MIN: int   = 120      # RMSSD obs search: +/- 2h around 08:00
+_OVERNIGHT_DT_MIN:   int   = 10       # predict step size for blind overnight [min]
+_GATE_MIN_DAYS:      int   = 60       # minimum paired predictions per user
+_GATE_PASS_FRAC:     float = 0.60     # fraction of users where Twin must win both
+_EWMA_ALPHA:         float = 2.0 / 8.0  # EWMA span=7d: alpha = 2/(7+1)
+_DT_CLAMP_MIN:       float = 1.0      # minimum dt_real for UKF [min]
+_DT_CLAMP_MAX:       float = 60.0     # maximum dt_real for UKF [min]
+_WARMUP_DAYS:        int   = 14       # days excluded from scoring (filter burn-in)
 
 
-# ── Decision enum ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Result containers
+# ---------------------------------------------------------------------------
 
 class GateZeroDecision(Enum):
     PASS              = "PASS"
@@ -79,381 +116,412 @@ class GateZeroDecision(Enum):
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
 
 
-# ── Per-user result ───────────────────────────────────────────────────────────
+class DayPrediction(NamedTuple):
+    """One inter-day prediction record (day D -> day D+1 morning)."""
+    day_index:          int
+    predicted_ln_rmssd: float
+    observed_ln_rmssd:  float
+    persist_ln_rmssd:   float
+    ewma_ln_rmssd:      float
+
 
 class UserValidationResult(NamedTuple):
-    user_id:        str | int
-    n_test_steps:   int
-    mae_twin:       float   # MAE of UKF predict-step HR [bpm]
-    mae_baseline:   float   # MAE of 7-day rolling mean HR [bpm]
-    twin_wins:      bool    # mae_twin < mae_baseline
+    user_id:             str | int
+    n_days:              int
+    mae_twin:            float
+    mae_persistence:     float
+    mae_ewma7d:          float
+    twin_beats_persist:  bool
+    twin_beats_ewma:     bool
+    twin_wins:           bool        # beats BOTH baselines simultaneously
+    days:                list        # list[DayPrediction]
 
-
-# ── Gate Zero aggregate result ────────────────────────────────────────────────
 
 class GateZeroResult(NamedTuple):
-    decision:           GateZeroDecision
-    n_users_total:      int
-    n_users_twin_wins:  int
-    win_fraction:       float
-    per_user:           list   # list[UserValidationResult]
-    gate_criterion:     str    # human-readable threshold description
+    decision:            GateZeroDecision
+    n_users_total:       int
+    n_users_twin_wins:   int
+    win_fraction:        float
+    per_user:            list        # list[UserValidationResult]
+    gate_criterion:      str
 
 
-# ── Walk-forward splitter ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Day grouping helpers
+# ---------------------------------------------------------------------------
 
-class WalkForwardSplitter:
+def _day_of(ts_min: int, t0: int) -> int:
+    return (ts_min - t0) // _MINS_PER_DAY
+
+
+def _minute_of_day(ts_min: int, t0: int) -> int:
+    return (ts_min - t0) % _MINS_PER_DAY
+
+
+def _group_by_day(records: list[dict], t0: int) -> dict[int, list[dict]]:
+    groups: dict[int, list[dict]] = {}
+    for r in records:
+        d = _day_of(r["timestamp_min"], t0)
+        groups.setdefault(d, []).append(r)
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# EWMA tracker (log-space HRV)
+# ---------------------------------------------------------------------------
+
+class LogRMSSDEWMA:
+    """Exp-weighted moving average of ln(RMSSD_obs_ms) with span=7d (alpha=0.25)."""
+
+    def __init__(self, alpha: float = _EWMA_ALPHA) -> None:
+        self._alpha  = alpha
+        self._value: float | None = None
+
+    def update(self, ln_rmssd: float) -> None:
+        if self._value is None:
+            self._value = ln_rmssd
+        else:
+            self._value = self._alpha * ln_rmssd + (1.0 - self._alpha) * self._value
+
+    def predict(self) -> float | None:
+        return self._value
+
+
+# ---------------------------------------------------------------------------
+# Blind overnight integrator
+# ---------------------------------------------------------------------------
+
+def _blind_overnight_predict(
+    state:    GaussianState,
+    params:   CardioTransitionParams,
+    n_min:    int,
+    dt_min:   int = _OVERNIGHT_DT_MIN,
+) -> GaussianState:
     """
-    Splits a chronological observation list into train/test at a fixed train fraction.
+    Run UKF predict-only for n_min minutes under sleep conditions.
 
-    Default: 50% train, 50% test. Test must be ≥ 60 days.
+    Sleep controls: power=0, T_core=37.0, pv_drop=0.
+    Uses dt_min-minute steps. Q is Wiener-scaled per step.
+    No measurement update -- pure blind recovery simulation.
+
+    The bi-exp W' pools (tau=2 and 30 min) and Autonomic_Tone (tau_rec ~20 min)
+    drive towards their equilibrium values under zero exercise stress. The 7-day
+    RMSSD_load_7d state barely moves (tau=10080 min) and serves as the slow
+    inter-day signal for trend-tracking.
     """
+    u = jnp.array([0.0, 37.0, 0.0], dtype=jnp.float32)
 
-    def __init__(self, train_fraction: float = 0.50) -> None:
-        if not (0.0 < train_fraction < 1.0):
-            raise ValueError(f"train_fraction must be in (0, 1), got {train_fraction}")
-        self.train_fraction = train_fraction
+    sleep_params = CardioTransitionParams(
+        cardio           = params.cardio,
+        dt_min           = float(dt_min),
+        hub_T_core       = 37.0,
+        hub_pv_drop_pct  = 0.0,
+    )
+    Q_step = scale_Q(Q_DEFAULT, float(dt_min))
 
-    def split(
-        self, records: list[dict]
-    ) -> tuple[list[dict], list[dict]]:
-        """
-        Split records into (train, test).
-
-        Records must be sorted by timestamp_min ascending.
-
-        Raises
-        ------
-        ValueError if fewer than 60 days of records, or if test window < 60 days.
-        """
-        if not records:
-            raise ValueError("WalkForwardSplitter: records is empty.")
-
-        t_min = records[0]["timestamp_min"]
-        t_max = records[-1]["timestamp_min"]
-        total_days = (t_max - t_min) / _MINS_PER_DAY
-
-        if total_days < _GATE_MIN_DAYS:
-            raise ValueError(
-                f"WalkForwardSplitter: total span {total_days:.1f} days < "
-                f"required {_GATE_MIN_DAYS} days."
+    current = state
+    elapsed = 0
+    while elapsed < n_min:
+        step = min(dt_min, n_min - elapsed)
+        if step != dt_min:
+            part_params = CardioTransitionParams(
+                cardio=params.cardio, dt_min=float(step),
+                hub_T_core=37.0, hub_pv_drop_pct=0.0,
             )
+            Q_part = scale_Q(Q_DEFAULT, float(step))
+            m, c = _ukf_predict_cardio(current.mean, current.cov, u, part_params, Q_part)
+        else:
+            m, c = _ukf_predict_cardio(current.mean, current.cov, u, sleep_params, Q_step)
+        current = GaussianState(mean=m, cov=c)
+        elapsed += step
 
-        split_min = t_min + self.train_fraction * (t_max - t_min)
-        train = [r for r in records if r["timestamp_min"] <  split_min]
-        test  = [r for r in records if r["timestamp_min"] >= split_min]
-
-        if not train:
-            raise ValueError("WalkForwardSplitter: train set is empty.")
-        if not test:
-            raise ValueError("WalkForwardSplitter: test set is empty.")
-
-        test_days = (test[-1]["timestamp_min"] - test[0]["timestamp_min"]) / _MINS_PER_DAY
-        if test_days < _GATE_MIN_DAYS:
-            raise ValueError(
-                f"WalkForwardSplitter: test window {test_days:.1f} days < "
-                f"required {_GATE_MIN_DAYS} days."
-            )
-
-        return train, test
+    return current
 
 
-# ── Rolling mean baseline ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Core inter-day validator
+# ---------------------------------------------------------------------------
 
-class RollingMeanBaseline:
+class InterDayTwinValidator:
     """
-    7-day rolling mean baseline for HR prediction.
+    Inter-day walk-forward HRV prediction engine.
 
-    Computes the mean of all HR observations in the trailing 7-day window.
-    Initialised from the training set; updated as test observations are consumed.
-    """
-
-    def __init__(self, window_days: int = _ROLLING_WINDOW_DAYS) -> None:
-        self._window_min = window_days * _MINS_PER_DAY
-        self._buffer:    deque[tuple[int, float]] = deque()  # (timestamp_min, hr)
-        self._sum:       float = 0.0
-        self._n:         int   = 0
-
-    def fit(self, train_records: list[dict]) -> None:
-        """Load training window HR observations into rolling buffer."""
-        for r in train_records:
-            hr = r.get("HR_obs_bpm")
-            if hr is not None and not math.isnan(float(hr)):
-                self._buffer.append((r["timestamp_min"], float(hr)))
-                self._sum += float(hr)
-                self._n   += 1
-
-    def predict(self, timestamp_min: int) -> float:
-        """
-        Return the rolling mean HR as of `timestamp_min`.
-
-        Evicts observations older than window_days from the buffer.
-
-        Returns float('nan') if no observations are in the window.
-        """
-        cutoff = timestamp_min - self._window_min
-        while self._buffer and self._buffer[0][0] < cutoff:
-            _, evicted_hr = self._buffer.popleft()
-            self._sum -= evicted_hr
-            self._n   -= 1
-
-        return self._sum / self._n if self._n > 0 else float("nan")
-
-    def observe(self, timestamp_min: int, hr_obs: float) -> None:
-        """Feed an observed HR into the rolling buffer after predicting for this step."""
-        if not math.isnan(hr_obs):
-            self._buffer.append((timestamp_min, hr_obs))
-            self._sum += hr_obs
-            self._n   += 1
-
-
-# ── Twin validator ────────────────────────────────────────────────────────────
-
-class TwinValidator:
-    """
-    One-step-ahead HR prediction via the cardiorespiratory UKF.
-
-    Uses only the predict step (no update) to produce out-of-sample forecasts.
-    The prior state is the posterior from the previous step in the training set,
-    then rolled forward through the test set with UKF update.
-
-    Walk-forward protocol:
-        1. Warm-up: run full UKF (predict + update) on training set.
-        2. Test: for each test step:
-               a. Record predict-step HR mean (BEFORE update) as the forecast.
-               b. Run UKF update to propagate state.
-               c. Compare forecast vs HR_obs.
+    For each day D (after warmup):
+        1. Assimilate all intra-day records with async UKF.
+        2. Blind overnight predict to 08:00 next day.
+        3. Read AT(08:00) -> predicted RMSSD.
+        4. Score against next morning's observed RMSSD.
     """
 
     def __init__(
         self,
         transition_params: CardioTransitionParams | None = None,
+        warmup_days:       int = _WARMUP_DAYS,
     ) -> None:
-        self._filter = CardioStateFilter()
-        self._trans  = transition_params or DEFAULT_TRANSITION_PARAMS
+        self._filter   = CardioStateFilter()
+        self._params   = transition_params or DEFAULT_TRANSITION_PARAMS
+        self._warmup   = warmup_days
 
-    def warm_up(self, train_records: list[dict]) -> GaussianState:
+    def run(self, records: list[dict]) -> list[DayPrediction]:
         """
-        Run full UKF on training records. Returns final posterior state.
+        Run the full inter-day protocol.
 
-        Raises RuntimeError if UKF diverges (NaN in posterior_mean).
-        """
-        state = GaussianState(mean=X0_CARDIO_DEFAULT, cov=P0_CARDIO_DEFAULT)
-        for r in train_records:
-            state = self._filter.update_state(
-                prior        = state,
-                observations = self._obs_from_record(r),
-                controls     = self._ctrl_from_record(r),
-                params       = self._trans,
-            )
-        return state
-
-    def evaluate_test(
-        self,
-        warm_state:   GaussianState,
-        test_records: list[dict],
-    ) -> tuple[list[float], list[float]]:
-        """
-        Walk-forward evaluation on test records.
+        Parameters
+        ----------
+        records : list[dict] -- chronologically sorted observation records.
 
         Returns
         -------
-        (twin_preds, true_hrs)
-            twin_preds : list[float] — UKF predict-step HR means [bpm]
-            true_hrs   : list[float] — observed HRs (NaN excluded from both lists)
+        list[DayPrediction] -- one entry per day with a valid paired prediction.
         """
-        state     = warm_state
-        preds:    list[float] = []
-        actuals:  list[float] = []
+        if not records:
+            raise ValueError("InterDayTwinValidator.run: records is empty.")
 
-        for r in test_records:
-            hr_obs = r.get("HR_obs_bpm")
-            if hr_obs is None or math.isnan(float(hr_obs)):
-                # No ground truth for this step — skip prediction (no information)
-                # Still run UKF update so state stays synchronised
-                state = self._filter.update_state(
-                    prior        = state,
-                    observations = self._obs_from_record(r),
-                    controls     = self._ctrl_from_record(r),
-                    params       = self._trans,
-                )
-                continue
+        t0     = records[0]["timestamp_min"]
+        by_day = _group_by_day(records, t0)
 
-            # ── Predict step: HR mean BEFORE assimilation ─────────────────
-            # Run predict only (no update) to get the genuine out-of-sample forecast
-            from app.slices.cardiorespiratory.filter import _ukf_predict_cardio, Q_DEFAULT
-            u = np.array([
-                r.get("power_watts",      0.0),
-                r.get("hub_T_core",       float("nan")),
-                r.get("hub_pv_drop_pct",  0.0),
-            ], dtype=np.float32)
-            import jax.numpy as jnp
-            mean_pred, _ = _ukf_predict_cardio(
-                state.mean, state.cov,
-                jnp.array(u, dtype=jnp.float32),
-                self._trans, Q_DEFAULT,
-            )
-            hr_pred = float(mean_pred[IDX_HR])
+        state: GaussianState = GaussianState(
+            mean=X0_CARDIO_DEFAULT, cov=P0_CARDIO_DEFAULT
+        )
+        persist_ln: float | None = None
+        ewma = LogRMSSDEWMA()
+        preds: list[DayPrediction] = []
 
-            if math.isnan(hr_pred):
-                raise RuntimeError(
-                    "TwinValidator: NaN in UKF predict-step HR. "
-                    "Filter diverged — check Q/R and initial state."
-                )
+        for day_idx in sorted(by_day.keys()):
+            day_recs = sorted(by_day[day_idx], key=lambda r: r["timestamp_min"])
 
-            preds.append(hr_pred)
-            actuals.append(float(hr_obs))
+            # ── Update baselines with THIS day's morning RMSSD observation ──
+            today_ln = _find_morning_rmssd_ln(by_day, day_idx, t0)
+            if today_ln is not None:
+                ewma.update(today_ln)
+                persist_ln = today_ln
 
-            # ── Update step: assimilate actual observation ─────────────────
+            # ── 1. Daytime assimilation ──────────────────────────────────────
+            state, last_ts = self._assimilate_day(state, day_recs)
+
+            # ── 2. Blind overnight predict to next morning 08:00 ─────────────
+            morning_next_abs = t0 + (day_idx + 1) * _MINS_PER_DAY + _MORNING_TARGET_MIN
+            predict_min = max(30, morning_next_abs - last_ts)
+            state_0800 = _blind_overnight_predict(state, self._params, predict_min)
+
+            # ── 3. Predicted RMSSD via Autonomic_Tone(08:00) ─────────────────
+            at_0800       = float(jnp.clip(state_0800.mean[IDX_AT], 0.0, 1.0))
+            rmssd_ref     = float(self._params.cardio.RMSSD_ref_ms)
+            pred_rmssd    = max(at_0800 * rmssd_ref, 1.0)
+            pred_ln       = math.log(pred_rmssd)
+
+            # ── 4. Ground truth: next morning RMSSD ───────────────────────────
+            obs_ln = _find_morning_rmssd_ln(by_day, day_idx + 1, t0)
+
+            # ── 5. Emit prediction if all signals available and past warmup ───
+            ewma_pred = ewma.predict()
+            if (
+                day_idx >= self._warmup
+                and obs_ln      is not None
+                and persist_ln  is not None
+                and ewma_pred   is not None
+            ):
+                preds.append(DayPrediction(
+                    day_index          = day_idx,
+                    predicted_ln_rmssd = pred_ln,
+                    observed_ln_rmssd  = obs_ln,
+                    persist_ln_rmssd   = persist_ln,
+                    ewma_ln_rmssd      = ewma_pred,
+                ))
+
+        return preds
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _assimilate_day(
+        self,
+        state: GaussianState,
+        day_recs: list[dict],
+    ) -> tuple[GaussianState, int]:
+        """Run full UKF (predict+update) on all records for one day."""
+        prev_ts: int | None = None
+        for r in day_recs:
+            ts     = r["timestamp_min"]
+            dt_real = float(ts - prev_ts) if prev_ts is not None else 1.0
+            dt_real = max(_DT_CLAMP_MIN, min(dt_real, _DT_CLAMP_MAX))
+
             state = self._filter.update_state(
                 prior        = state,
-                observations = self._obs_from_record(r),
-                controls     = self._ctrl_from_record(r),
-                params       = self._trans,
+                observations = {
+                    "HR_obs_bpm":   r.get("HR_obs_bpm",   float("nan")),
+                    "VO2_obs":      r.get("VO2_obs",       float("nan")),
+                    "RMSSD_obs_ms": r.get("RMSSD_obs_ms",  float("nan")),
+                },
+                controls = {
+                    "power_watts":     r.get("power_watts",     0.0),
+                    "hub_T_core":      r.get("hub_T_core",      float("nan")),
+                    "hub_pv_drop_pct": r.get("hub_pv_drop_pct", 0.0),
+                },
+                params  = self._params,
+                dt_real = dt_real,
             )
+            prev_ts = ts
 
-        return preds, actuals
-
-    # ── Helpers ───────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _obs_from_record(r: dict) -> dict[str, float]:
-        return {
-            "HR_obs_bpm":    r.get("HR_obs_bpm",   float("nan")),
-            "VO2_obs":       r.get("VO2_obs",       float("nan")),
-            "RMSSD_obs_ms":  r.get("RMSSD_obs_ms",  float("nan")),
-        }
-
-    @staticmethod
-    def _ctrl_from_record(r: dict) -> dict[str, float]:
-        return {
-            "power_watts":      r.get("power_watts",      0.0),
-            "hub_T_core":       r.get("hub_T_core",       float("nan")),
-            "hub_pv_drop_pct":  r.get("hub_pv_drop_pct",  0.0),
-        }
+        return state, day_recs[-1]["timestamp_min"]
 
 
-# ── Gate Zero entry point ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# RMSSD morning observation lookup
+# ---------------------------------------------------------------------------
+
+def _find_morning_rmssd_ln(
+    by_day:     dict[int, list[dict]],
+    target_day: int,
+    t0:         int,
+) -> float | None:
+    """
+    Find ln(RMSSD_obs_ms) for target_day within +/-2h window around 08:00.
+    Returns None if no valid observation exists.
+    """
+    if target_day not in by_day:
+        return None
+
+    lo = _MORNING_TARGET_MIN - _MORNING_WINDOW_MIN   # 360 = 06:00
+    hi = _MORNING_TARGET_MIN + _MORNING_WINDOW_MIN   # 600 = 10:00
+
+    best: float | None = None
+    best_dist = _MORNING_WINDOW_MIN + 1
+
+    for r in by_day[target_day]:
+        rmssd = r.get("RMSSD_obs_ms")
+        if rmssd is None or math.isnan(float(rmssd)) or float(rmssd) <= 0.0:
+            continue
+        mod = _minute_of_day(r["timestamp_min"], t0)
+        if lo <= mod <= hi:
+            dist = abs(mod - _MORNING_TARGET_MIN)
+            if dist < best_dist:
+                best_dist = dist
+                best      = float(rmssd)
+
+    return math.log(best) if best is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Gate Zero entry point
+# ---------------------------------------------------------------------------
 
 def run_gate_zero(
-    users_data: dict[str | int, list[dict]],
+    users_data:        dict,
     transition_params: CardioTransitionParams | None = None,
-    train_fraction: float = 0.50,
+    warmup_days:       int = _WARMUP_DAYS,
 ) -> GateZeroResult:
     """
-    Run the Gate Zero walk-forward validation across all users.
+    Run Gate Zero inter-day HRV validation across all users.
 
     Parameters
     ----------
-    users_data        : {user_id: list[dict]} — per-user chronological records
-    transition_params : ODE + filter params; None = population prior
-    train_fraction    : fraction of each user's data used for warm-up
+    users_data        : {user_id: list[dict]} -- per-user records (need not be sorted)
+    transition_params : ODE + filter params (None = population prior)
+    warmup_days       : UKF burn-in days excluded from scoring (default 14)
 
     Returns
     -------
-    GateZeroResult with PASS | FAIL | INSUFFICIENT_DATA decision
+    GateZeroResult with PASS | FAIL | INSUFFICIENT_DATA decision.
 
     Raises
     ------
     ValueError if users_data is empty.
-    RuntimeError if any user's UKF diverges (propagated).
+    RuntimeError propagated if UKF diverges for any user.
     """
     if not users_data:
         raise ValueError("run_gate_zero: users_data is empty.")
 
-    splitter  = WalkForwardSplitter(train_fraction=train_fraction)
+    validator = InterDayTwinValidator(
+        transition_params=transition_params,
+        warmup_days=warmup_days,
+    )
     per_user: list[UserValidationResult] = []
-    skipped   = 0
+    skipped = 0
 
     for uid, records in users_data.items():
-        # Sort chronologically
         records = sorted(records, key=lambda r: r["timestamp_min"])
 
+        if not records:
+            logger.warning("run_gate_zero: user %s -- empty records, skipped.", uid)
+            skipped += 1
+            continue
+
+        span_days = (records[-1]["timestamp_min"] - records[0]["timestamp_min"]) / _MINS_PER_DAY
+        if span_days < _GATE_MIN_DAYS:
+            logger.warning(
+                "run_gate_zero: user %s -- span %.1f days < %d, skipped.",
+                uid, span_days, _GATE_MIN_DAYS,
+            )
+            skipped += 1
+            continue
+
         try:
-            train, test = splitter.split(records)
-        except ValueError as exc:
-            logger.warning("run_gate_zero: user %s skipped — %s", uid, exc)
+            day_preds = validator.run(records)
+        except (ValueError, RuntimeError) as exc:
+            logger.warning("run_gate_zero: user %s -- exception: %s", uid, exc)
             skipped += 1
             continue
 
-        # ── Baseline ──────────────────────────────────────────────────────
-        baseline = RollingMeanBaseline()
-        baseline.fit(train)
-
-        # ── Twin warm-up ──────────────────────────────────────────────────
-        twin = TwinValidator(transition_params=transition_params)
-        warm_state = twin.warm_up(train)
-
-        # ── Walk-forward evaluation ───────────────────────────────────────
-        twin_preds, actuals = twin.evaluate_test(warm_state, test)
-
-        if not twin_preds:
-            logger.warning("run_gate_zero: user %s has no valid HR observations in test set.", uid)
+        if len(day_preds) < _GATE_MIN_DAYS:
+            logger.warning(
+                "run_gate_zero: user %s -- only %d paired days (< %d), skipped.",
+                uid, len(day_preds), _GATE_MIN_DAYS,
+            )
             skipped += 1
             continue
 
-        # Baseline predictions (aligned to the same steps as twin_preds)
-        # Re-run baseline in order on test set to get aligned predictions
-        baseline2 = RollingMeanBaseline()
-        baseline2.fit(train)
-        hr_test_records = [r for r in test if (
-            r.get("HR_obs_bpm") is not None and
-            not math.isnan(float(r.get("HR_obs_bpm", float("nan"))))
-        )]
-        base_preds: list[float] = []
-        for r in hr_test_records:
-            base_pred = baseline2.predict(r["timestamp_min"])
-            base_preds.append(base_pred if not math.isnan(base_pred) else float(actuals[0]) if actuals else 70.0)
-            baseline2.observe(r["timestamp_min"], float(r["HR_obs_bpm"]))
+        err_twin    = np.array([abs(d.predicted_ln_rmssd - d.observed_ln_rmssd) for d in day_preds])
+        err_persist = np.array([abs(d.persist_ln_rmssd   - d.observed_ln_rmssd) for d in day_preds])
+        err_ewma    = np.array([abs(d.ewma_ln_rmssd      - d.observed_ln_rmssd) for d in day_preds])
 
-        n = min(len(twin_preds), len(base_preds), len(actuals))
-        if n == 0:
-            skipped += 1
-            continue
+        mae_twin    = float(np.mean(err_twin))
+        mae_persist = float(np.mean(err_persist))
+        mae_ewma    = float(np.mean(err_ewma))
 
-        mae_twin     = float(np.mean(np.abs(np.array(twin_preds[:n]) - np.array(actuals[:n]))))
-        mae_baseline = float(np.mean(np.abs(np.array(base_preds[:n]) - np.array(actuals[:n]))))
-        twin_wins    = mae_twin < mae_baseline
+        beats_persist = mae_twin < mae_persist
+        beats_ewma    = mae_twin < mae_ewma
+        twin_wins     = beats_persist and beats_ewma
 
         per_user.append(UserValidationResult(
-            user_id      = uid,
-            n_test_steps = n,
-            mae_twin     = mae_twin,
-            mae_baseline = mae_baseline,
-            twin_wins    = twin_wins,
+            user_id            = uid,
+            n_days             = len(day_preds),
+            mae_twin           = mae_twin,
+            mae_persistence    = mae_persist,
+            mae_ewma7d         = mae_ewma,
+            twin_beats_persist = beats_persist,
+            twin_beats_ewma    = beats_ewma,
+            twin_wins          = twin_wins,
+            days               = list(day_preds),
         ))
-
         logger.info(
-            "run_gate_zero user=%s n=%d mae_twin=%.3f mae_baseline=%.3f twin_wins=%s",
-            uid, n, mae_twin, mae_baseline, twin_wins,
+            "Gate Zero  user=%-12s  n=%3d  mae_twin=%.4f  "
+            "mae_persist=%.4f  mae_ewma=%.4f  wins=%s",
+            uid, len(day_preds), mae_twin, mae_persist, mae_ewma, twin_wins,
         )
 
-    n_users     = len(per_user)
+    n_users = len(per_user)
     if n_users == 0:
-        logger.error("run_gate_zero: no users had sufficient data (skipped=%d).", skipped)
+        logger.error(
+            "run_gate_zero: no users had sufficient data (skipped=%d).", skipped
+        )
         return GateZeroResult(
             decision          = GateZeroDecision.INSUFFICIENT_DATA,
             n_users_total     = 0,
             n_users_twin_wins = 0,
             win_fraction      = 0.0,
             per_user          = [],
-            gate_criterion    = (
-                f"twin MAE < baseline (7-day rolling mean) in "
-                f"≥{_GATE_PASS_FRACTION:.0%} of users | "
-                f"≥{_GATE_MIN_DAYS} days test window"
-            ),
+            gate_criterion    = _gate_criterion_str(warmup_days),
         )
 
     n_wins       = sum(1 for u in per_user if u.twin_wins)
     win_fraction = n_wins / n_users
-
-    if win_fraction >= _GATE_PASS_FRACTION:
-        decision = GateZeroDecision.PASS
-    else:
-        decision = GateZeroDecision.FAIL
+    decision     = (
+        GateZeroDecision.PASS if win_fraction >= _GATE_PASS_FRAC
+        else GateZeroDecision.FAIL
+    )
 
     logger.info(
-        "run_gate_zero RESULT=%s win_fraction=%.2f (%d/%d users) skipped=%d",
+        "Gate Zero RESULT=%s  win_fraction=%.2f (%d/%d users)  skipped=%d",
         decision.value, win_fraction, n_wins, n_users, skipped,
     )
 
@@ -463,9 +531,16 @@ def run_gate_zero(
         n_users_twin_wins = n_wins,
         win_fraction      = win_fraction,
         per_user          = per_user,
-        gate_criterion    = (
-            f"twin MAE < baseline (7-day rolling mean) in "
-            f"≥{_GATE_PASS_FRACTION:.0%} of users | "
-            f"≥{_GATE_MIN_DAYS} days test window"
-        ),
+        gate_criterion    = _gate_criterion_str(warmup_days),
+    )
+
+
+def _gate_criterion_str(warmup_days: int) -> str:
+    return (
+        f"Twin MAE(ln RMSSD) < Persistence AND EWMA-7d "
+        f"in >={_GATE_PASS_FRAC:.0%} users | "
+        f">={_GATE_MIN_DAYS} paired prediction days | "
+        f"warmup={warmup_days} days | "
+        f"target=ln(RMSSD_obs_ms) at 08:00 | "
+        f"overnight_dt={_OVERNIGHT_DT_MIN} min"
     )

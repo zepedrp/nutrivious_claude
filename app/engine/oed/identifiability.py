@@ -195,11 +195,18 @@ def analyze_fim(
     min_ev_abs = jnp.maximum(jnp.min(jnp.abs(eigenvalues)), jnp.float32(1e-30))
     cond       = float(max_ev / min_ev_abs)
 
-    unid_params = [
-        param_names[i]
-        for i in range(len(param_names))
-        if bool(unid_mask[i])
-    ]
+    # Project each unidentifiable eigenvector onto the parameter axes.
+    # Eigenvalue index i does NOT correspond to parameter i -- eigh returns
+    # eigenvectors in an arbitrary rotated basis. We find the parameter axis
+    # each unidentifiable eigenvector most aligns with (|v_ij| largest).
+    unid_params: list = []
+    for i in range(len(param_names)):
+        if bool(unid_mask[i]):
+            evec        = eigenvectors[:, i]      # i-th eigenvector (column)
+            dom_idx     = int(jnp.argmax(jnp.abs(evec)))
+            dom_name    = param_names[dom_idx]
+            if dom_name not in unid_params:       # deduplicate for D=2 edge cases
+                unid_params.append(dom_name)
 
     return FIMResult(
         fim                   = fim,

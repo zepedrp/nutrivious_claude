@@ -350,15 +350,17 @@ def make_scan_rk4_forward(
     ... )
     >>> result = evaluate_identifiability(fwd, log_theta0, jnp.eye(2), THETA_NAMES)
     """
-    dt_f32 = jnp.float32(dt)
-    half   = jnp.float32(0.5) * dt_f32
+    _N_SUB   = 10                                  # sub-steps per outer dt (stiff stability)
+    dt_f32   = jnp.float32(dt)
+    dt_sub   = dt_f32 / jnp.float32(_N_SUB)
+    half_sub = jnp.float32(0.5) * dt_sub
 
-    def _rk4_step(x: jax.Array, args: tuple, t: jax.Array) -> jax.Array:
-        k1 = ode_fn(t,        x,              args)
-        k2 = ode_fn(t + half, x + half * k1,  args)
-        k3 = ode_fn(t + half, x + half * k2,  args)
-        k4 = ode_fn(t + dt_f32, x + dt_f32 * k3, args)
-        return x + (dt_f32 / jnp.float32(6.0)) * (k1 + jnp.float32(2.0)*k2
+    def _rk4_sub_step(x: jax.Array, args: tuple, t: jax.Array) -> jax.Array:
+        k1 = ode_fn(t,             x,                args)
+        k2 = ode_fn(t + half_sub,  x + half_sub * k1, args)
+        k3 = ode_fn(t + half_sub,  x + half_sub * k2, args)
+        k4 = ode_fn(t + dt_sub,    x + dt_sub   * k3, args)
+        return x + (dt_sub / jnp.float32(6.0)) * (k1 + jnp.float32(2.0)*k2
                                                        + jnp.float32(2.0)*k3 + k4)
 
     def forward_fn(theta: jax.Array) -> jax.Array:
@@ -366,7 +368,10 @@ def make_scan_rk4_forward(
         t_seq = jnp.arange(T, dtype=jnp.float32) * dt_f32
 
         def scan_body(x_carry: jax.Array, t_i: jax.Array):
-            x_next = _rk4_step(x_carry, args, t_i)
+            def sub_step(i: int, x_sub: jax.Array) -> jax.Array:
+                t_sub = t_i + jnp.float32(i) * dt_sub
+                return _rk4_sub_step(x_sub, args, t_sub)
+            x_next = jax.lax.fori_loop(0, _N_SUB, sub_step, x_carry)
             y_t    = h_fn(x_next)
             return x_next, y_t
 

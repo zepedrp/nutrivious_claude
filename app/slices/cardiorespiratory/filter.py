@@ -209,7 +209,7 @@ def _integrate_1min(
         y0        = x,
         args      = (params.cardio, power, t_core, pv_drop),
         saveat    = diffrax.SaveAt(t1=True),
-        max_steps = 32,
+        max_steps = 256,   # covers dt_min up to 25 min (overnight dt=10 min needs 100)
     )
     return sol.ys[0]
 

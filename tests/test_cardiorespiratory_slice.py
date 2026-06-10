@@ -320,6 +320,329 @@ def test_caen_2021_biphasic_recovery():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# T5: T-UKF Boundary Sticking Test (Simon 2010 variance_floor proof)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_tukf_boundary_sticking():
+    """
+    Simon 2010 variance floor: filter must NOT get stuck at physical boundary.
+
+    Physical background
+    -------------------
+    The W_fast / W_slow pools have a sigma-point artifact: large initial covariance
+    (P0 var(W_fast) = 4.0 kJ^2) spreads sigma points well above the mean, so the
+    UKF mean does NOT converge to zero during depletion -- high-W sigma points
+    resist drain proportionally.  The real clinical boundary-sticking risk in this
+    ODE is the AUTONOMIC TONE (AT in [0,1]), which is clamped by range_clamp_moments
+    and can become overconfident near AT=0 (full autonomic collapse).
+
+    Protocol
+    --------
+    Use a TIGHT covariance (var(AT) = 1e-4, below the floor = 1e-6 is enforced
+    by the filter PROCESS NOISE not the floor, so we test this differently):
+
+      Phase A -- exhaustion (100 steps @400W, starting from X0 resting state):
+        - AT drops from 1.0 toward its equilibrium value at 400W (~0.13).
+        - var(AT) is maintained above _VAR_FLOOR[IDX_AT] = 1e-6 at all times.
+        - var(W_fast) and var(W_slow) are maintained above their floors.
+        - No NaN in posterior after 100 steps.
+        - All covariance eigenvalues >= -1e-4 (PSD guarantee).
+
+      Phase B -- recovery (1 step @0W):
+        - AT must INCREASE immediately (no overconfidence / sticking).
+        - W_fast must INCREASE (ODE recovery kinetics tracked by filter).
+
+    Key assertions
+    --------------
+    (a) AT_100 < 0.40  : exhaustion reached (AT near equilibrium ~0.13 at 400W).
+    (b) AT_100 > 0.05  : AT stays physiologically positive (no collapse to zero).
+    (c) var(AT_100) >= _VAR_FLOOR[IDX_AT]  : floor maintained on AT dimension.
+    (d) var(W_fast_100) >= _VAR_FLOOR[IDX_WFAST]  : floor maintained on W_fast.
+    (e) var(W_slow_100) >= _VAR_FLOOR[IDX_WSLOW]  : floor maintained on W_slow.
+    (f) posterior eigenvalues >= -1e-4  : covariance PSD (no runaway errors).
+    (g) AT_101 > AT_100  : recovery tracked immediately at P=0 W.
+    (h) W_fast_101 > W_fast_100  : W_fast recovery begins in step 101.
+    """
+    from app.slices.cardiorespiratory.filter import _VAR_FLOOR
+
+    filt  = CardioStateFilter()
+    trans = CardioTransitionParams(
+        cardio  = DEFAULT_CARDIO_SLICE_PARAMS,
+        dt_min  = 1.0,
+    )
+
+    # Start from X0 resting (AT=1.0, W pools fully charged)
+    state = GaussianState(mean=X0_CARDIO_DEFAULT, cov=P0_CARDIO_DEFAULT)
+
+    # 100 steps at 400W (far above CP=250W); HR observed every 5 steps
+    for step in range(100):
+        hr_obs = 185.0 if step % 5 == 0 else float("nan")
+        state = filt.update_state(
+            prior        = state,
+            observations = {
+                "HR_obs_bpm":   hr_obs,
+                "VO2_obs":      float("nan"),
+                "RMSSD_obs_ms": float("nan"),
+            },
+            controls = {
+                "power_watts":     400.0,
+                "hub_T_core":      38.5,
+                "hub_pv_drop_pct": 3.0,
+            },
+            params = trans,
+        )
+
+    cov_np     = np.array(state.cov,  dtype=np.float64)
+    mean_np    = np.array(state.mean, dtype=np.float64)
+    at_step100  = float(mean_np[IDX_AT])
+    wf_step100  = float(mean_np[IDX_WFAST])
+    var_at      = float(cov_np[IDX_AT,    IDX_AT])
+    var_wf      = float(cov_np[IDX_WFAST, IDX_WFAST])
+    var_ws      = float(cov_np[IDX_WSLOW, IDX_WSLOW])
+    eigvals     = np.linalg.eigvalsh(cov_np)
+    min_eig     = float(eigvals.min())
+
+    print(f"\n[T5] After 100 steps @400W:")
+    print(f"     AT={at_step100:.4f}  W_fast={wf_step100:.4f} kJ")
+    print(f"     var(AT)={var_at:.2e}  var(W_fast)={var_wf:.2e}  var(W_slow)={var_ws:.2e}")
+    print(f"     min eigenvalue={min_eig:.2e}")
+
+    # (a) AT must be depressed -- equilibrium at 400W is ~0.13
+    assert at_step100 < 0.40, (
+        f"AT must be depressed after 100 steps @400W (exhaust equilibrium ~0.13); "
+        f"got AT={at_step100:.4f}"
+    )
+    # (b) AT must stay physically positive
+    assert at_step100 > 0.05, (
+        f"AT collapsed below physiological floor; got AT={at_step100:.4f}"
+    )
+    # (c) variance_floor on AT dimension
+    floor_at = float(_VAR_FLOOR[IDX_AT])
+    assert var_at >= floor_at, (
+        f"Simon 2010 variance_floor violated for AT: "
+        f"var={var_at:.2e} < floor={floor_at:.2e}  (overconfidence at boundary)"
+    )
+    # (d) variance_floor on W_fast
+    floor_wf = float(_VAR_FLOOR[IDX_WFAST])
+    assert var_wf >= floor_wf, (
+        f"Simon 2010 variance_floor violated for W_fast: "
+        f"var={var_wf:.2e} < floor={floor_wf:.2e}"
+    )
+    # (e) variance_floor on W_slow
+    floor_ws = float(_VAR_FLOOR[IDX_WSLOW])
+    assert var_ws >= floor_ws, (
+        f"Simon 2010 variance_floor violated for W_slow: "
+        f"var={var_ws:.2e} < floor={floor_ws:.2e}"
+    )
+    # (f) Covariance PSD (Higham 1988 nearest_psd repair intact)
+    assert min_eig >= -1e-4, (
+        f"Posterior covariance not PSD after 100 exhaustion steps: "
+        f"min eigenvalue={min_eig:.2e}"
+    )
+
+    # Phase B: one recovery step at P=0W
+    state_rec = filt.update_state(
+        prior        = state,
+        observations = {
+            "HR_obs_bpm":   float("nan"),
+            "VO2_obs":      float("nan"),
+            "RMSSD_obs_ms": float("nan"),
+        },
+        controls = {
+            "power_watts":     0.0,
+            "hub_T_core":      37.0,
+            "hub_pv_drop_pct": 0.0,
+        },
+        params = trans,
+    )
+
+    at_step101  = float(state_rec.mean[IDX_AT])
+    wf_step101  = float(state_rec.mean[IDX_WFAST])
+
+    print(f"[T5] After step 101 @0W:")
+    print(f"     AT={at_step101:.4f}  (delta={at_step101 - at_step100:+.5f})")
+    print(f"     W_fast={wf_step101:.4f} kJ  (delta={wf_step101 - wf_step100:+.5f})")
+
+    # (g) AT recovers immediately -- no sticking at exhaustion boundary
+    assert at_step101 > at_step100, (
+        f"AT must recover at P=0 (no boundary sticking at AT={at_step100:.4f}); "
+        f"AT_100={at_step100:.4f}  AT_101={at_step101:.4f}"
+    )
+    # (h) W_fast begins recovery
+    assert wf_step101 > wf_step100, (
+        f"W_fast must begin recovery at P=0; "
+        f"W_fast_100={wf_step100:.4f}  W_fast_101={wf_step101:.4f}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T6: Gate Zero -- 60-day Realistic Micro-Cycle Data
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _generate_micro_cycle_records(
+    n_days: int = 75,
+    seed:   int = 42,
+) -> list[dict]:
+    """
+    Generate synthetic athlete records for a HIIT/Z2/Rest micro-cycle.
+
+    Week structure (repeating):
+        Mon  HIIT  6x3min @350W (18 min total above CP)
+        Tue  Z2    45min @200W  (below CP -- aerobic base)
+        Wed  Rest  no exercise
+        Thu  HIIT  6x3min @350W
+        Fri  Z2    45min @200W
+        Sat  Z2    45min @200W
+        Sun  Rest  no exercise
+
+    Per-day records:
+        - Morning (08:00): RMSSD_obs_ms (HRV wearable; derived from AT state)
+        - Session (10:00 onward): 1 record per minute with HR_obs_bpm + power_watts
+
+    RMSSD generation uses an AR(1) fatigue-recovery model:
+        - Hard training day: AT suppressed proportional to training stress
+        - Rest day: AT recovers toward 1.0 with time constant 1 day
+        - RMSSD = AT * RMSSD_BASE + N(0, 5) ms
+
+    Returns
+    -------
+    list[dict] sorted by timestamp_min; total span >= n_days days.
+    """
+    rng        = np.random.default_rng(seed)
+    RMSSD_BASE = 35.0     # ms population mean (Malik 1996)
+    MINS_PER_DAY  = 1440
+    SESSION_START = 600   # 10:00
+
+    # Weekly session blocks: list of (power_W, duration_min)
+    HIIT_SESSION = [(350.0, 3), (100.0, 3)] * 3   # 3x(3min on / 3min off) = 18 min
+    Z2_SESSION   = [(200.0, 45)]
+    REST_SESSION: list = []
+
+    WEEK = [
+        HIIT_SESSION, Z2_SESSION, REST_SESSION,
+        HIIT_SESSION, Z2_SESSION, Z2_SESSION, REST_SESSION,
+    ]
+
+    # Simple HR model: HR = HR_rest + intensity_fraction * HR_range
+    def _hr(power: float) -> float:
+        HR_REST, HR_MAX = 58.0, 190.0
+        frac = min(power / 350.0, 1.0)
+        return HR_REST + frac * (HR_MAX - HR_REST)
+
+    records: list[dict] = []
+    at_state = 1.0   # AR(1) autonomous tone proxy [0, 1]
+
+    for day in range(n_days):
+        day_offset = day * MINS_PER_DAY
+
+        # Morning RMSSD record (HR and VO2 absent -- omit keys so .get() returns nan)
+        rmssd_obs = max(1.0, at_state * RMSSD_BASE + float(rng.normal(0.0, 5.0)))
+        records.append({
+            "timestamp_min": day_offset + 480,   # 08:00
+            "RMSSD_obs_ms":  float(rmssd_obs),
+            "power_watts":   0.0,
+            "hub_T_core":    37.0,
+            "hub_pv_drop_pct": 0.0,
+        })
+
+        # Exercise session
+        dow     = day % 7
+        session = WEEK[dow]
+        ts      = day_offset + SESSION_START
+        session_stress = 0.0
+
+        for power, dur_min in session:
+            hr_base = _hr(power)
+            t_core  = 37.5 if power > 250 else 37.0
+            pv_drop = 2.0  if power > 250 else 0.5
+            for _ in range(dur_min):
+                hr_obs = hr_base + float(rng.normal(0.0, 3.0))
+                # RMSSD absent during exercise -- omit key so .get() returns nan
+                records.append({
+                    "timestamp_min":   ts,
+                    "HR_obs_bpm":      float(hr_obs),
+                    "power_watts":     float(power),
+                    "hub_T_core":      float(t_core),
+                    "hub_pv_drop_pct": float(pv_drop),
+                })
+                ts += 1
+            session_stress += power * dur_min / (350.0 * 18.0)   # normalised load
+
+        # Update AR(1) AT state (fatigue = suppression, rest = recovery)
+        if session_stress > 0.0:
+            at_state = max(0.15, at_state * (1.0 - 0.30 * session_stress))
+        else:
+            at_state = min(1.00, at_state + 0.18 * (1.0 - at_state))   # rest recovery
+
+    return sorted(records, key=lambda r: r["timestamp_min"])
+
+
+def test_gate_zero_micro_cycle_60d():
+    """
+    Gate Zero with a 60-day HIIT/Z2/Rest micro-cycle.
+
+    Validates that:
+    (a) Pipeline completes without error (not INSUFFICIENT_DATA).
+    (b) Exactly 1 user processed with sufficient paired predictions.
+    (c) n_days >= 60 paired (predict, observe) pairs scored.
+    (d) MAE values are finite (no NaN/Inf leaking through the pipeline).
+    (e) Circadian and L3 NLME paths both execute without crash
+        (NLME falls back gracefully if numpyro absent).
+
+    The gate outcome (PASS / FAIL) is informational only -- it depends on ODE
+    parameter accuracy relative to the AR(1) synthetic HRV, which is not
+    required to match perfectly.  The test probes pipeline correctness, not
+    model performance.
+    """
+    from app.validation.backtest_engine import run_gate_zero, GateZeroDecision
+
+    records = _generate_micro_cycle_records(n_days=75, seed=42)
+    print(f"\n[T6] Generated {len(records)} records over 75 days.")
+
+    result = run_gate_zero(
+        users_data      = {"athlete_synthetic": records},
+        warmup_days     = 14,
+        wake_hour       = 8.0,
+        nlme_train_days = 30,
+        nlme_steps      = 200,    # minimal steps -- just proves wiring, not convergence
+    )
+
+    print(f"[T6] Gate Zero decision: {result.decision.value}")
+    print(f"[T6] Users total={result.n_users_total}  twin_wins={result.n_users_twin_wins}")
+    if result.per_user:
+        u = result.per_user[0]
+        print(
+            f"[T6] n_days={u.n_days}  "
+            f"mae_twin={u.mae_twin:.4f}  "
+            f"mae_persist={u.mae_persistence:.4f}  "
+            f"mae_ewma={u.mae_ewma7d:.4f}"
+        )
+
+    # (a) Pipeline completed -- not starved of data
+    assert result.decision != GateZeroDecision.INSUFFICIENT_DATA, (
+        "Gate Zero returned INSUFFICIENT_DATA -- data generator or pipeline broken."
+    )
+
+    # (b) Exactly 1 user processed
+    assert result.n_users_total == 1, (
+        f"Expected 1 user; got {result.n_users_total}"
+    )
+
+    # (c) Sufficient scored days
+    n_days = result.per_user[0].n_days
+    assert n_days >= 60, (
+        f"Expected >= 60 paired prediction days; got {n_days}"
+    )
+
+    # (d) All MAE values finite
+    u = result.per_user[0]
+    assert math.isfinite(u.mae_twin),        f"mae_twin is not finite: {u.mae_twin}"
+    assert math.isfinite(u.mae_persistence), f"mae_persistence is not finite: {u.mae_persistence}"
+    assert math.isfinite(u.mae_ewma7d),      f"mae_ewma7d is not finite: {u.mae_ewma7d}"
+    assert u.mae_twin > 0.0,                 f"mae_twin is zero -- predictions are perfect/constant"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -327,10 +650,12 @@ if __name__ == "__main__":
     import traceback, sys
 
     tests = [
-        ("T1 -- Cardiovascular Drift",          test_cardiovascular_drift),
-        ("T2 -- W' Depletion + Steal",           test_w_prime_respiratory_steal),
-        ("T3 -- UKF Stability (sparse obs)",    test_ukf_stability),
-        ("T4 -- Caen 2021 Biphasic Recovery",   test_caen_2021_biphasic_recovery),
+        ("T1 -- Cardiovascular Drift",             test_cardiovascular_drift),
+        ("T2 -- W' Depletion + Steal",              test_w_prime_respiratory_steal),
+        ("T3 -- UKF Stability (sparse obs)",       test_ukf_stability),
+        ("T4 -- Caen 2021 Biphasic Recovery",      test_caen_2021_biphasic_recovery),
+        ("T5 -- T-UKF Boundary Sticking",          test_tukf_boundary_sticking),
+        ("T6 -- Gate Zero 60d Micro-Cycle",        test_gate_zero_micro_cycle_60d),
     ]
 
     passed = 0

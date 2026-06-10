@@ -263,9 +263,16 @@ def _blind_overnight_predict(
         hub_T_core      = 37.0,
         hub_pv_drop_pct = 0.0,
     )
-    # Phase 2 params: circadian-boosted k_AT_rec + slight core temp drop
+    # Phase 2 params: circadian-boosted k_AT_rec AND elevated AT equilibrium.
+    # circ_amp shifts AT_target inside the ODE to (1.0 + _amp); k_AT_rec boost
+    # accelerates convergence toward that target. UKF sigma points propagate
+    # through the ODE unmodified -- covariance P is correct by construction.
+    _amp = _circ - 1.0   # circadian amplitude, e.g. 0.13 at wake_hour=08:00
     p2 = CardioTransitionParams(
-        cardio          = params.cardio._replace(k_AT_rec=params.cardio.k_AT_rec * _circ),
+        cardio          = params.cardio._replace(
+            k_AT_rec = params.cardio.k_AT_rec * _circ,
+            circ_amp = _amp,
+        ),
         dt_min          = float(dt_min),
         hub_T_core      = 36.5,
         hub_pv_drop_pct = 0.0,
@@ -306,20 +313,6 @@ def _blind_overnight_predict(
             m, c = _ukf_predict_cardio(current.mean, current.cov, u2, p2, Q_step2)
         current = GaussianState(mean=m, cov=c)
         elapsed += step
-
-    # Circadian amplitude boost: AT equilibrium under sleep is 1.0 + amplitude
-    # (Borbely two-process: Process C pushes vagal tone above daytime baseline
-    # near SCN peak; the ODE alone cannot exceed 1.0 because its recovery term
-    # is anchored at 1.0, so we apply the circadian offset post-integration).
-    _amp = _circ - 1.0   # e.g., 0.13 at wake_hour=08:00
-    new_at = jnp.minimum(
-        current.mean[IDX_AT] + jnp.float32(_amp),
-        jnp.float32(1.0 + _amp),    # AT_max = 1.0 + circadian_amplitude
-    )
-    current = GaussianState(
-        mean=current.mean.at[IDX_AT].set(new_at),
-        cov=current.cov,
-    )
 
     return current
 
@@ -497,47 +490,56 @@ class InterDayTwinValidator:
         if not records:
             raise ValueError("InterDayTwinValidator.run: records is empty.")
 
-        # Align t0 to midnight of the first day so _minute_of_day returns
-        # the correct time-of-day regardless of when the first record arrives.
         _t0_raw = records[0]["timestamp_min"]
         t0      = _t0_raw - (_t0_raw % _MINS_PER_DAY)
         by_day  = _group_by_day(records, t0)
 
-        state: GaussianState = GaussianState(
-            mean=X0_CARDIO_DEFAULT, cov=P0_CARDIO_DEFAULT
-        )
+        # ── PASS 1: read warmup RMSSD observations (no UKF) ──────────────────
+        # Read-only scan over warmup days to collect ground-truth morning RMSSD.
+        # This avoids building covariance under the wrong RMSSD_ref_ms.
+        warmup_rmssd_ms: list[float] = []
+        for day_idx in sorted(d for d in by_day if d < self._warmup):
+            ln = _find_morning_rmssd_ln(by_day, day_idx, t0)
+            if ln is not None:
+                warmup_rmssd_ms.append(math.exp(ln))
+
+        # Personal RMSSD_ref_ms calibration (Two-Pass Fix 2).
+        # Must happen before Pass 2 so the UKF builds P under the correct model.
+        if warmup_rmssd_ms:
+            personal_ms = max(5.0, float(np.median(warmup_rmssd_ms)))
+            self._params = self._params._replace(
+                cardio=self._params.cardio._replace(RMSSD_ref_ms=personal_ms)
+            )
+            logger.info(
+                "RMSSD_ref_ms personalised: %.1f ms (n=%d warmup mornings)",
+                personal_ms, len(warmup_rmssd_ms),
+            )
+
+        # ── PASS 2: reset to X0/P0 and re-assimilate warmup with calibrated params
+        # X0 seeded with the personal RMSSD_ref_ms so RMSSD_load_7d starts at the
+        # correct chronic baseline (not the population 35 ms default).
+        rmssd_ref_now  = self._params.cardio.RMSSD_ref_ms
+        x0_personal    = X0_CARDIO_DEFAULT.at[IDX_RMSSD7D].set(jnp.float32(rmssd_ref_now))
+        state: GaussianState = GaussianState(mean=x0_personal, cov=P0_CARDIO_DEFAULT)
+        ewma       = LogRMSSDEWMA()
         persist_ln: float | None = None
-        ewma = LogRMSSDEWMA()
+
+        for day_idx in sorted(d for d in by_day if d < self._warmup):
+            day_recs = sorted(by_day[day_idx], key=lambda r: r["timestamp_min"])
+            ln = _find_morning_rmssd_ln(by_day, day_idx, t0)
+            if ln is not None:
+                ewma.update(ln)
+                persist_ln = ln
+            state, _ = self._assimilate_day(state, day_recs)
+
+        # ── SCORING: Gate Zero predictions from warmup-exit state ─────────────
         preds: list[DayPrediction] = []
 
-        warmup_rmssd_ms: list[float] = []  # morning RMSSD obs during warmup
-        _calibrated = False
-
-        for day_idx in sorted(by_day.keys()):
+        for day_idx in sorted(d for d in by_day if d >= self._warmup):
             day_recs = sorted(by_day[day_idx], key=lambda r: r["timestamp_min"])
 
             # Update baselines with THIS day's morning RMSSD observation
             today_ln = _find_morning_rmssd_ln(by_day, day_idx, t0)
-
-            # Collect warmup RMSSD observations for personal calibration
-            if day_idx < self._warmup and today_ln is not None:
-                warmup_rmssd_ms.append(math.exp(today_ln))
-
-            # Personal RMSSD_ref_ms calibration at warmup boundary (Fix 3)
-            # Replaces population default (35 ms) with the athlete's own baseline.
-            if day_idx == self._warmup and not _calibrated:
-                if warmup_rmssd_ms:
-                    personal_ms = float(np.median(warmup_rmssd_ms))
-                    personal_ms = max(5.0, personal_ms)   # sanity floor
-                    self._params = self._params._replace(
-                        cardio=self._params.cardio._replace(RMSSD_ref_ms=personal_ms)
-                    )
-                    logger.info(
-                        "RMSSD_ref_ms personalised: %.1f ms (n=%d warmup mornings)",
-                        personal_ms, len(warmup_rmssd_ms),
-                    )
-                _calibrated = True
-
             if today_ln is not None:
                 ewma.update(today_ln)
                 persist_ln = today_ln
@@ -553,10 +555,9 @@ class InterDayTwinValidator:
                 wake_hour=self._wake_hour,
             )
 
-            # 3. Predicted RMSSD: RMSSD_load_7d(08:00) * AT(08:00) (Fix 2)
+            # 3. Predicted RMSSD: RMSSD_load_7d(08:00) * AT(08:00)
             # RMSSD_load_7d is the 7-day chronic load state (ms); AT is the daily
-            # vagal modulator [0, 1+circadian_amplitude] -- their product predicts
-            # next-morning RMSSD anchored to both chronic load and acute recovery.
+            # vagal modulator -- circ_amp inside the ODE allows AT > 1.0 at SCN peak.
             rmssd_load_7d = float(state_0800.mean[IDX_RMSSD7D])
             at_0800       = float(jnp.clip(state_0800.mean[IDX_AT], 0.0, 2.0))
             pred_rmssd    = max(rmssd_load_7d * at_0800, 1.0)
@@ -565,11 +566,10 @@ class InterDayTwinValidator:
             # 4. Ground truth: next morning RMSSD
             obs_ln = _find_morning_rmssd_ln(by_day, day_idx + 1, t0)
 
-            # 5. Emit prediction if all signals available and past warmup
+            # 5. Emit prediction if all signals available
             ewma_pred = ewma.predict()
             if (
-                day_idx >= self._warmup
-                and obs_ln     is not None
+                obs_ln     is not None
                 and persist_ln is not None
                 and ewma_pred  is not None
             ):

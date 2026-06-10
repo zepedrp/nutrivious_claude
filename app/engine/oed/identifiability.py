@@ -13,11 +13,15 @@ y_t_obs ~ N(y_t, R), the Fisher Information Matrix (FIM) at parameter point thet
 where J_t = dy_t/d(theta) is the sensitivity matrix (Jacobian of the observation
 map with respect to the parameters at time t).
 
-Sensitivities are computed via jax.jacrev (reverse-mode automatic differentiation),
-which is exact (not finite-difference) and JIT-traceable. Reverse-mode AD is required
-because diffrax.RecursiveCheckpointAdjoint only checkpoints VJP (reverse) passes;
-using jacfwd bypasses the checkpoint and triggers catastrophic O(T) memory unroll
-on long or stiff trajectories.
+Sensitivities are computed via jax.jacfwd (forward-mode automatic differentiation),
+which is exact (not finite-difference) and JIT-traceable. For FIM computation where
+D (parameters) << T (time steps), forward-mode AD requires O(D) JVP passes vs
+O(T) VJP passes for reverse-mode -- D=2..10 vs T=100..10000 is a clear win.
+
+CRITICAL: forward_fn MUST be built with make_scan_rk4_forward (lax.scan + RK4),
+NOT by wrapping diffrax.diffeqsolve. The adaptive solver uses jax.lax.while_loop
+whose JVP tape accumulates O(T) memory, destroying the speed/memory advantage.
+A fixed-step scan has O(1) memory per JVP step and compiles to a static loop.
 
 Identifiability Criterion
 --------------------------
@@ -38,10 +42,11 @@ This is the scalar metric used by OEDProtocolGenerator to rank candidate protoco
 Compatibility
 -------------
 - Pure JAX: all array operations are JIT-traceable and vmap-safe.
-- jax.jacrev traces through jax.lax.scan and diffrax.diffeqsolve (which uses
-  jax.lax.while_loop + RecursiveCheckpointAdjoint). Both support VJP in JAX >= 0.4.
-- If a slice uses a non-differentiable op, provide a simplified forward_fn
-  (e.g., fixed-step RK4) instead of the production diffrax solver.
+- Use make_scan_rk4_forward to build forward_fn. lax.scan + fixed-step RK4 gives
+  O(1) JVP memory per step and compiles as a static loop (no while_loop tape).
+- Do NOT wrap diffrax.diffeqsolve in forward_fn for jacfwd: the adaptive solver's
+  while_loop accumulates a JVP tape of length proportional to actual solver steps,
+  causing O(T * n_solver_steps) memory blow-up.
 
 References
 ----------
@@ -115,7 +120,7 @@ def compute_fim(
     R_inv:      object,
 ) -> jax.Array:
     """
-    Compute FIM = sum_t J_t^T @ R^{-1} @ J_t via jax.jacrev.
+    Compute FIM = sum_t J_t^T @ R^{-1} @ J_t via jax.jacfwd.
 
     Parameters
     ----------
@@ -132,15 +137,17 @@ def compute_fim(
 
     Notes
     -----
-    J = jax.jacrev(forward_fn)(theta) has shape:
+    J = jax.jacfwd(forward_fn)(theta) has shape:
         (T, D)          if forward_fn returns (T,)
         (T, obs_dim, D) if forward_fn returns (T, obs_dim)
 
     FIM for scalar obs: R_inv * J.T @ J
     FIM for vector obs: einsum("tij,il,tlk->jk", J, R_inv, J)
         which equals sum_t J_t.T @ R_inv @ J_t for each t.
+
+    Build forward_fn with make_scan_rk4_forward to guarantee O(1) memory per step.
     """
-    J = jax.jacrev(forward_fn)(theta)
+    J = jax.jacfwd(forward_fn)(theta)
 
     if J.ndim == 2:
         # J: (T, D) -- scalar observation channel
@@ -266,3 +273,104 @@ def evaluate_identifiability(
     """
     fim = compute_fim(forward_fn, theta, R_inv)
     return analyze_fim(fim, list(param_names), threshold_rel)
+
+
+# ---------------------------------------------------------------------------
+# Fixed-step RK4 forward simulator for memory-safe jacfwd
+# ---------------------------------------------------------------------------
+
+def make_scan_rk4_forward(
+    ode_fn:    Callable,
+    h_fn:      Callable,
+    x0:        jax.Array,
+    make_args: Callable,
+    T:         int,
+    dt:        float = 1.0,
+) -> Callable:
+    """
+    Build a forward_fn(theta) -> (T, obs_dim) using fixed-step RK4 + jax.lax.scan.
+
+    This is the required wrapper for compute_fim / jacfwd.  It replaces the
+    anti-pattern of wrapping diffrax.diffeqsolve (whose while_loop accumulates a
+    JVP tape of length O(T * n_solver_steps) under jacfwd).
+
+    Fixed-step lax.scan gives O(1) JVP memory per step because:
+    - The scan body is a *static* function compiled once.
+    - JAX differentiates through lax.scan via the efficient associative-scan rule.
+    - No dynamic loop tape is accumulated during forward-mode differentiation.
+
+    Complexity vs alternatives
+    --------------------------
+    D = n_params,  T = n_time_steps,  S = n_adaptive_solver_steps
+
+      method                      | CPU          | RAM
+      jacfwd + lax.scan RK4       | O(D * T)     | O(1) per step   <-- this fn
+      jacfwd + diffrax while_loop | O(D * T * S) | O(T * S)        <-- BAD
+      jacrev + RecursiveAdjoint   | O(T)         | O(sqrt(T))      <-- good for D>>T
+
+    Parameters
+    ----------
+    ode_fn    : (t, x, args) -> dx/dt.  Must be JAX-differentiable.
+    h_fn      : (x) -> (obs_dim,).  Observation function.
+    x0        : (state_dim,) initial state -- constant (not differentiated).
+    make_args : theta (D,) -> args accepted by ode_fn.  Must be JAX-differentiable.
+    T         : number of RK4 steps.
+    dt        : step size in same units as the ODE's independent variable.
+
+    Returns
+    -------
+    forward_fn : theta (D,) -> y (T, obs_dim)
+        JIT-compilable and jacfwd-safe.
+
+    Example
+    -------
+    >>> from app.slices.cardiorespiratory.ode import (
+    ...     cardiorespiratory_slice_ode, X0_CARDIO_DEFAULT,
+    ...     DEFAULT_CARDIO_SLICE_PARAMS,
+    ... )
+    >>> import jax.numpy as jnp
+    >>>
+    >>> # Linearise around VO2max and W' capacity (log-space)
+    >>> THETA_NAMES = ["log_VO2max", "log_W_prime"]
+    >>> log_theta0  = jnp.log(jnp.array([45.0, 18.0]))
+    >>>
+    >>> def make_args(log_th):
+    ...     p = DEFAULT_CARDIO_SLICE_PARAMS._replace(
+    ...         VO2_max_baseline = jnp.exp(log_th[0]),
+    ...         W_prime_capacity = jnp.exp(log_th[1]),
+    ...     )
+    ...     return (p, 300.0, 37.0, 0.0)   # 300 W effort
+    >>>
+    >>> def h_fn(x):
+    ...     return x[jnp.array([1, 0])]    # observe HR and VO2
+    >>>
+    >>> fwd = make_scan_rk4_forward(
+    ...     cardiorespiratory_slice_ode, h_fn,
+    ...     X0_CARDIO_DEFAULT, make_args, T=60, dt=1.0,
+    ... )
+    >>> result = evaluate_identifiability(fwd, log_theta0, jnp.eye(2), THETA_NAMES)
+    """
+    dt_f32 = jnp.float32(dt)
+    half   = jnp.float32(0.5) * dt_f32
+
+    def _rk4_step(x: jax.Array, args: tuple, t: jax.Array) -> jax.Array:
+        k1 = ode_fn(t,        x,              args)
+        k2 = ode_fn(t + half, x + half * k1,  args)
+        k3 = ode_fn(t + half, x + half * k2,  args)
+        k4 = ode_fn(t + dt_f32, x + dt_f32 * k3, args)
+        return x + (dt_f32 / jnp.float32(6.0)) * (k1 + jnp.float32(2.0)*k2
+                                                       + jnp.float32(2.0)*k3 + k4)
+
+    def forward_fn(theta: jax.Array) -> jax.Array:
+        args  = make_args(theta)
+        t_seq = jnp.arange(T, dtype=jnp.float32) * dt_f32
+
+        def scan_body(x_carry: jax.Array, t_i: jax.Array):
+            x_next = _rk4_step(x_carry, args, t_i)
+            y_t    = h_fn(x_next)
+            return x_next, y_t
+
+        _, ys = jax.lax.scan(scan_body, x0, t_seq)
+        return ys   # (T, obs_dim)
+
+    return forward_fn

@@ -148,6 +148,13 @@ class CardioSliceParams(NamedTuple):
     # ── Numerical guards ─────────────────────────────────────────────────
     HR_floor: float   # bpm
 
+    # ── Circadian modulator (Borbely 1982 two-process model) ─────────────
+    # AT equilibrium shifts to (1.0 + circ_amp) during Phase 2 sleep.
+    # Set to 0.0 for all daytime operation; injected by _blind_overnight_predict.
+    # Propagated correctly through UKF sigma points inside the ODE -- no external
+    # mean-hacks needed.
+    circ_amp: float = 0.0   # adim; AT_target = 1.0 + circ_amp
+
 
 # ── Population-mean default parameters ───────────────────────────────────────
 
@@ -198,6 +205,9 @@ DEFAULT_CARDIO_SLICE_PARAMS = CardioSliceParams(
 
     # Numerical guard
     HR_floor = 30.0,
+
+    # Circadian modulator (always off for daytime / default params)
+    circ_amp = 0.0,
 )
 
 
@@ -372,8 +382,11 @@ def cardiorespiratory_slice_ode(
         jnp.float32(0.0),
         jnp.float32(1.0) - W_total_real / jnp.maximum(W_cap, jnp.float32(0.1)),
     )
+    # AT_target = 1.0 during daytime (circ_amp=0); elevated during Phase 2 sleep.
+    # sigma points all carry the same circ_amp so covariance propagates correctly.
+    AT_target = jnp.float32(1.0) + jnp.float32(params.circ_amp)
     dAT_dt = (
-        jnp.float32(params.k_AT_rec) * (jnp.float32(1.0) - Autonomic_Tone)
+        jnp.float32(params.k_AT_rec) * (AT_target - Autonomic_Tone)
         - jnp.float32(params.k_AT_sup) * P_norm * Autonomic_Tone
         - jnp.float32(params.k_AT_W)   * w_depletion * Autonomic_Tone
     )

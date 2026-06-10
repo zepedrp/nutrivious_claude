@@ -1,8 +1,17 @@
 """
-app/slices/thermo_renal/filter.py  —  L4 UKF, Thermo-Renal V2
+app/slices/thermo_renal/filter.py  —  L4 TUKF, Thermo-Renal V3.0
 
-5-state Unscented Kalman Filter over the thermo-renal state:
+5-state Truncated Unscented Kalman Filter over the thermo-renal state:
   [Core_Temp_C, Skin_Temp_C, Plasma_Volume_L, Inters_Volume_L, Plasma_Sodium_mmol]
+
+Uses the canonical UKF primitives from app.engine.assimilation.ukf_filter:
+    sigma_points        — eigh-based, PSD-robust (replaces jnp.linalg.cholesky)
+    unscented_transform — weighted mean + covariance from propagated sigma pts
+    nearest_psd         — Higham (1988) PSD repair after update
+    variance_floor      — Simon (2010) §5.4 minimum variance enforcement
+    range_clamp_moments — truncated-normal [lb, ub] for physical hard bounds
+    lower_clamp_moments — truncated-normal lb for non-negative constraints
+    clamp_dim           — applies per-dimension truncated correction to (mean, cov)
 
 UKF parametrisation (Merwe & Wan 2000):
   alpha = 0.10  (MANDATORY — float32 stability; alpha=1e-3 underflows with n=5)
@@ -14,15 +23,23 @@ UKF parametrisation (Merwe & Wan 2000):
 Time step: dt_minutes (default 1.0 min).
 Integrator: diffrax.Tsit5, dt0=0.1 min, max_steps=512.
 
-State clamp: jnp.maximum(x, 0) applied after each ODE step (volumes, sodium).
+Physical clamp bounds (Simon 2010 — range_clamp_moments):
+  Core_Temp_C  : [35.0, 42.0]   °C  — hypothermia floor / hyperthermia ceiling
+  Skin_Temp_C  : [15.0, 42.0]   °C  — physical skin temperature range
+  Plasma_Volume_L   : lb=0.5    L   — physiological minimum
+  Inters_Volume_L   : lb=0.5    L   — physiological minimum
+  Plasma_Sodium_mmol: lb=0.0    mmol — non-negative
 
 Fail-Loud contract:
   NaN in posterior_mean → RuntimeError.
   Negative covariance diagonal → RuntimeError.
-  Covariance symmetrised each step.
+  Covariance symmetrised and nearest_psd-repaired each step.
 
 References
   Merwe R., Wan E. (2000) Proc. ASSPCC
+  Simon D. (2010) Optimal State Estimation, Wiley §5.3-5.4
+  Higham N.J. (1988) Linear Algebra Appl. 103:103-118
+  Fiala D. et al. (1999) J Appl Physiol 87(5):1957-1972  [2-node thermo]
 """
 from __future__ import annotations
 
@@ -51,28 +68,50 @@ from app.slices.thermo_renal.observation import (
     h_tr_sigma,
     inflate_R_tr,
 )
-from app.engine.assimilation.ukf_filter import GaussianState
+from app.engine.assimilation.ukf_filter import (
+    GaussianState,
+    sigma_points,
+    unscented_transform,
+    nearest_psd,
+    variance_floor,
+    ukf_weights,
+    range_clamp_moments,
+    lower_clamp_moments,
+    clamp_dim,
+)
 
 logger = logging.getLogger(__name__)
 
 # ── UKF weights (n = STATE_DIM = 5, alpha = 0.10) ─────────────────────────────
+
 _ALPHA: float = 0.10
 _BETA:  float = 2.0
 _KAPPA: float = 0.0
 _N:     int   = STATE_DIM   # 5
 
-_LAM:  float = _ALPHA ** 2 * (_N + _KAPPA) - _N   # = 0.01×5 − 5 = −4.95
-_NL:   float = _N + _LAM                           # = 0.05
+_WM, _WC, _LAM = ukf_weights(_N, _ALPHA, _BETA, _KAPPA)
 
-_WM_0: float = _LAM / _NL                          # = −99.0
-_WC_0: float = _WM_0 + (1.0 - _ALPHA ** 2 + _BETA) # = −99 + 2.99 = −96.01
-_WI:   float = 0.5 / _NL                           # = 10.0
+# Variance floor per state dimension (prevents filter overconfidence)
+_VAR_FLOOR_TR: jax.Array = jnp.array([
+    1e-4,    # Core_Temp_C         (σ_min ≈ 0.01 °C)
+    4e-4,    # Skin_Temp_C         (σ_min ≈ 0.02 °C)
+    1e-4,    # Plasma_Volume_L     (σ_min ≈ 0.01 L)
+    4e-4,    # Inters_Volume_L     (σ_min ≈ 0.02 L)
+    1.0,     # Plasma_Sodium_mmol  (σ_min ≈ 1 mmol)
+], dtype=jnp.float32)
 
-_WM: jax.Array = jnp.array([_WM_0] + [_WI] * (2 * _N), dtype=jnp.float32)
-_WC: jax.Array = jnp.array([_WC_0] + [_WI] * (2 * _N), dtype=jnp.float32)
+# Physical bounds for range_clamp_moments (Simon 2010 eq. 5.31)
+_CORE_TEMP_LB:   float = 35.0    # °C  — severe hypothermia floor
+_CORE_TEMP_UB:   float = 42.0    # °C  — life-threatening hyperthermia ceiling
+_SKIN_TEMP_LB:   float = 15.0    # °C  — physical lower bound
+_SKIN_TEMP_UB:   float = 42.0    # °C  — same upper bound as core
+_PV_LB:          float = 0.5     # L   — physiological minimum plasma volume
+_IV_LB:          float = 0.5     # L   — physiological minimum interstitial volume
+_NA_LB:          float = 0.0     # mmol — non-negative sodium
 
 
 # ── Process noise Q (per MINUTE) ─────────────────────────────────────────────
+
 _Q_DIAG_PER_MIN: jax.Array = jnp.array([
     3e-4,   # Core_Temp_C  [°C²/min]
     5e-3,   # Skin_Temp_C  [°C²/min]
@@ -114,30 +153,49 @@ def _integrate_step(
         max_steps = 512,
     )
     x_next = sol.ys[0]
-    return jnp.maximum(x_next, jnp.float32(0.0))   # clamp all states ≥ 0
+    return jnp.maximum(x_next, jnp.float32(0.0))   # coarse clamp before TUKF
 
 
-# ── Pure-JAX UKF kernels ──────────────────────────────────────────────────────
+# ── Physical clamp: truncated-normal moment matching (Simon 2010) ─────────────
 
-def _sigma_points(mean: jax.Array, cov: jax.Array) -> jax.Array:
-    """Generate 2n+1 sigma points via Cholesky decomposition."""
-    n   = mean.shape[0]
-    L   = jnp.linalg.cholesky(jnp.float32(_NL) * cov)     # (n, n)
-    sp0 = mean[None, :]                                      # (1, n)
-    sp_pos = mean[None, :] + L.T                             # (n, n)
-    sp_neg = mean[None, :] - L.T                             # (n, n)
-    return jnp.concatenate([sp0, sp_pos, sp_neg], axis=0)   # (2n+1, n)
-
-
-def _recover_mean_cov(
-    pts:       jax.Array,
-    noise_cov: jax.Array,
+def _apply_physical_clamps(
+    mean: jax.Array,
+    cov:  jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    mean = jnp.einsum("i,ij->j", _WM, pts)
-    diff = pts - mean[None, :]
-    cov  = jnp.einsum("i,ij,ik->jk", _WC, diff, diff) + noise_cov
+    """
+    Apply per-dimension truncated-normal clamps to (mean, cov).
+
+    Dimension layout:
+      0: Core_Temp_C      → range_clamp [35, 42]
+      1: Skin_Temp_C      → range_clamp [15, 42]
+      2: Plasma_Volume_L  → lower_clamp lb=0.5
+      3: Inters_Volume_L  → lower_clamp lb=0.5
+      4: Plasma_Sodium_mmol → lower_clamp lb=0
+    """
+    # Core_Temp_C: physiologically bounded [35°C, 42°C]
+    mu_new, s2_new = range_clamp_moments(mean[0], cov[0, 0], _CORE_TEMP_LB, _CORE_TEMP_UB)
+    mean, cov = clamp_dim(mean, cov, 0, mu_new, s2_new)
+
+    # Skin_Temp_C: physically bounded [15°C, 42°C]
+    mu_new, s2_new = range_clamp_moments(mean[1], cov[1, 1], _SKIN_TEMP_LB, _SKIN_TEMP_UB)
+    mean, cov = clamp_dim(mean, cov, 1, mu_new, s2_new)
+
+    # Plasma_Volume_L: must be ≥ 0.5 L
+    mu_new, s2_new = lower_clamp_moments(mean[2], cov[2, 2], _PV_LB)
+    mean, cov = clamp_dim(mean, cov, 2, mu_new, s2_new)
+
+    # Inters_Volume_L: must be ≥ 0.5 L
+    mu_new, s2_new = lower_clamp_moments(mean[3], cov[3, 3], _IV_LB)
+    mean, cov = clamp_dim(mean, cov, 3, mu_new, s2_new)
+
+    # Plasma_Sodium_mmol: must be ≥ 0
+    mu_new, s2_new = lower_clamp_moments(mean[4], cov[4, 4], _NA_LB)
+    mean, cov = clamp_dim(mean, cov, 4, mu_new, s2_new)
+
     return mean, cov
 
+
+# ── Pure-JAX UKF kernels (eigh-based) ─────────────────────────────────────────
 
 @jax.jit
 def _ukf_predict(
@@ -146,11 +204,16 @@ def _ukf_predict(
     u:      jax.Array,
     params: TRTransitionParams,
 ) -> tuple[jax.Array, jax.Array]:
-    """UKF predict: propagate sigma points through the TR ODE."""
-    Q_step      = Q_PER_MIN * jnp.float32(params.dt_minutes)
-    sigma       = _sigma_points(mean, cov)                         # (11, 5)
-    sigma_next  = jax.vmap(_integrate_step, in_axes=(0, None, None))(sigma, u, params)
-    return _recover_mean_cov(sigma_next, Q_step)
+    """UKF predict: propagate sigma points through the TR ODE (eigh-based)."""
+    Q_step = Q_PER_MIN * jnp.float32(params.dt_minutes)
+
+    # eigh-based sigma points (PSD-robust; no Cholesky failure)
+    spts      = sigma_points(mean, cov, _LAM)                              # (11, 5)
+    spts_next = jax.vmap(_integrate_step, in_axes=(0, None, None))(spts, u, params)  # (11, 5)
+
+    mu_pred, P_pred = unscented_transform(spts_next, Q_step, _WM, _WC)
+    P_pred = nearest_psd(P_pred)
+    return mu_pred, P_pred
 
 
 @jax.jit
@@ -162,30 +225,30 @@ def _ukf_update(
     tr_params:  ThermoRenalParams,
     R:          jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """UKF update: assimilate [Core_Temp_obs, Body_Mass_Drop_kg]."""
-    sigma   = _sigma_points(mean_pred, cov_pred)                   # (11, 5)
-    y_sigma = h_tr_sigma(sigma, obs_params, tr_params)             # (11, 2)
+    """UKF update: assimilate [Core_Temp_obs, Body_Mass_Drop_kg] (eigh-based)."""
+    spts   = sigma_points(mean_pred, cov_pred, _LAM)               # (11, 5)
+    y_sigma = h_tr_sigma(spts, obs_params, tr_params)               # (11, 2)
 
-    y_mean = jnp.einsum("i,ij->j", _WM, y_sigma)
-    dy_s   = y_sigma - y_mean[None, :]
-    dx_s   = sigma   - mean_pred[None, :]
+    y_mean, S = unscented_transform(y_sigma, R, _WM, _WC)          # (2,), (2, 2)
 
-    S_yy = jnp.einsum("i,ij,ik->jk", _WC, dy_s, dy_s) + R        # (2, 2)
-    P_xy = jnp.einsum("i,ij,ik->jk", _WC, dx_s, dy_s)            # (5, 2)
+    dx_s = spts   - mean_pred[None, :]    # (11, 5)
+    dy_s = y_sigma - y_mean[None, :]      # (11, 2)
+    P_xy = jnp.einsum("i,ij,ik->jk", _WC, dx_s, dy_s)             # (5, 2)
 
-    K              = P_xy @ jnp.linalg.inv(S_yy)
+    K              = P_xy @ jnp.linalg.inv(S)
     innovation     = y_obs - y_mean
     posterior_mean = mean_pred + K @ innovation
-    posterior_cov  = cov_pred  - K @ S_yy @ K.T
+    posterior_cov  = cov_pred  - K @ S @ K.T
 
-    return posterior_mean, posterior_cov
+    P_new = nearest_psd(posterior_cov)
+    return posterior_mean, P_new
 
 
 # ── Public filter class ───────────────────────────────────────────────────────
 
 class ThermoRenalStateFilter:
     """
-    L4 UKF for the 5-state Thermo-Renal V2 slice.
+    L4 TUKF for the 5-state Thermo-Renal V2 slice (V3.0 filter — canonical primitives).
 
     Usage
     -----
@@ -226,7 +289,7 @@ class ThermoRenalStateFilter:
         params:         TRTransitionParams | None = None,
     ) -> GaussianState:
         """
-        One-step UKF predict + update.
+        One-step TUKF predict + update with physical clamps.
 
         Parameters
         ----------
@@ -240,7 +303,7 @@ class ThermoRenalStateFilter:
 
         Returns
         -------
-        GaussianState — posterior (mean, cov)
+        GaussianState — posterior (mean, cov) with physical bounds enforced
         """
         if params is None:
             params = TRTransitionParams(tr=DEFAULT_TR_PARAMS, dt_minutes=float(dt_minutes))
@@ -271,10 +334,16 @@ class ThermoRenalStateFilter:
             y_pred[1] if bw_nan else float(bw_drop_obs),
         ], dtype=jnp.float32)
 
-        # Update
+        # Update (eigh-based, nearest_psd inside)
         posterior_mean, posterior_cov = _ukf_update(
             mean_pred, cov_pred, y_obs_arr, self.obs_params, params.tr, R_step
         )
+
+        # Truncated-normal physical clamps (Simon 2010 §5.3)
+        posterior_mean, posterior_cov = _apply_physical_clamps(posterior_mean, posterior_cov)
+
+        # Variance floor (Simon 2010 §5.4)
+        posterior_cov = variance_floor(posterior_cov, _VAR_FLOOR_TR)
 
         # Fail-Loud checks
         if bool(jnp.any(jnp.isnan(posterior_mean))):
@@ -290,5 +359,4 @@ class ThermoRenalStateFilter:
                 "Increase Q or R, or check ODE stability."
             )
 
-        posterior_cov = jnp.float32(0.5) * (posterior_cov + posterior_cov.T)
         return GaussianState(mean=posterior_mean, cov=posterior_cov)

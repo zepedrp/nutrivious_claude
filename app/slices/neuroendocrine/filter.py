@@ -1,9 +1,17 @@
 """
-app/slices/neuroendocrine/filter.py — L4 UKF: SAM × HPA × Somatotropic  V2.0
+app/slices/neuroendocrine/filter.py — L4 TUKF: SAM × HPA × Somatotropic  V3.0
 
 Unscented Kalman Filter for the 9-state:
     [Epinephrine, Norepinephrine, CRH, ACTH, Cortisol,
      GHRH, Somatostatin, GH, IGF-1]
+
+Uses the canonical UKF primitives from app.engine.assimilation.ukf_filter:
+    sigma_points        — eigh-based, PSD-robust (replaces jnp.linalg.cholesky)
+    unscented_transform — weighted mean + covariance from propagated sigma pts
+    nearest_psd         — Higham (1988) PSD repair after update
+    variance_floor      — Simon (2010) §5.4 minimum variance enforcement
+    lower_clamp_moments — truncated-normal lb=0 for hormone positivity
+    clamp_dim           — applies per-dimension truncated correction to (mean, cov)
 
 UKF parametrisation (van der Merwe & Wan 2000)
 -----------------------------------------------
@@ -25,7 +33,8 @@ Observation: y ∈ ℝ⁴ = [Epi_pgmL, NE_pgmL, Cortisol_nmolL, IGF1_ngmL]
 
 Thermodynamic constraint (MANDATORY)
 --------------------------------------
-    After each update, applies jnp.maximum(posterior_mean, 0.0).
+    After each update, truncated-normal lower clamp (lb=0) applied to all
+    9 dimensions via lower_clamp_moments + clamp_dim.
     Hormone concentrations cannot be negative.
 
 Fail-Loud contract
@@ -39,6 +48,8 @@ References
     van der Merwe & Wan (2000) Proc. ASSPCC
     Vinther et al. (2011) J Math Biol 63:663–690
     Goldstein (2010) Cell Mol Neurobiol 30:1283–1295
+    Simon D. (2010) Optimal State Estimation, Wiley §5.3-5.4
+    Higham N.J. (1988) Linear Algebra Appl. 103:103-118
 """
 from __future__ import annotations
 
@@ -57,6 +68,16 @@ from app.slices.neuroendocrine.observation import (
     NeuroObsParams, DEFAULT_OBS_PARAMS,
     h_neuro, observation_noise_R,
 )
+from app.engine.assimilation.ukf_filter import (
+    GaussianState,
+    sigma_points,
+    unscented_transform,
+    nearest_psd,
+    variance_floor,
+    ukf_weights,
+    lower_clamp_moments,
+    clamp_dim,
+)
 
 # ── UKF constants (α=0.10, n=9) ───────────────────────────────────────────────
 
@@ -65,16 +86,21 @@ _BETA   = 2.0
 _KAPPA  = 0.0
 _N      = STATE_DIM   # 9
 
-_LAMBDA   = _ALPHA ** 2 * (_N + _KAPPA) - _N   # = 0.09 - 9 = -8.91
-_N_LAMBDA = _N + _LAMBDA                         # = 0.09
+_WM, _WC, _LAM = ukf_weights(_N, _ALPHA, _BETA, _KAPPA)
 
-_W0_MEAN = _LAMBDA / _N_LAMBDA                   # = -99.0
-_WI_MEAN = 0.5 / _N_LAMBDA                       # = 5.5556
-_W0_COV  = _W0_MEAN + (1.0 - _ALPHA ** 2 + _BETA)  # = -99 + 2.99 = -96.01
-_WI_COV  = _WI_MEAN
-
-_WM = jnp.array([_W0_MEAN] + [_WI_MEAN] * (2 * _N))   # (2n+1 = 19,)
-_WC = jnp.array([_W0_COV]  + [_WI_COV]  * (2 * _N))
+# Variance floor per state (prevents overconfidence after truncated clamp)
+# Units: [pg/mL]², [pg/mL]², [pg/mL]², [pg/mL]², [nmol/L]², [pg/mL]², [pg/mL]², [ng/mL]², [ng/mL]²
+_VAR_FLOOR: jax.Array = jnp.array([
+    25.0,    # Epinephrine    (σ_min ≈ 5 pg/mL)
+    100.0,   # Norepinephrine (σ_min ≈ 10 pg/mL)
+    0.01,    # CRH
+    0.25,    # ACTH
+    25.0,    # Cortisol       (σ_min ≈ 5 nmol/L)
+    1.0,     # GHRH
+    1.0,     # Somatostatin
+    0.04,    # GH
+    25.0,    # IGF-1          (σ_min ≈ 5 ng/mL)
+], dtype=jnp.float32)
 
 
 # ── Filter state ───────────────────────────────────────────────────────────────
@@ -108,11 +134,30 @@ def default_process_noise_Q() -> jnp.ndarray:
     return jnp.diag(q_diag)
 
 
-# ── Physical clamp (thermodynamic invariant) ───────────────────────────────────
+# ── Physical clamp (truncated-normal, Simon 2010) ─────────────────────────────
 
 def _clamp_physical(x: jnp.ndarray) -> jnp.ndarray:
-    """All hormone concentrations must be ≥ 0."""
+    """All hormone concentrations must be ≥ 0 (used for sigma-point ODE output)."""
     return jnp.maximum(x, 0.0)
+
+
+def _apply_hormone_clamps(
+    mean: jnp.ndarray,
+    cov:  jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Apply truncated-normal lower bound (lb=0) to all 9 hormone dimensions.
+
+    Simon (2010) §5.3: updates mean and variance to reflect the fact that
+    the true distribution is truncated at 0. Cross-covariances are scaled
+    proportionally (clamp_dim).
+    """
+    for i in range(_N):
+        mu_i    = mean[i]
+        sig2_i  = cov[i, i]
+        mu_new, sig2_new = lower_clamp_moments(mu_i, sig2_i, lb=0.0)
+        mean, cov = clamp_dim(mean, cov, i, mu_new, sig2_new)
+    return mean, cov
 
 
 # ── Sigma-point ODE transition ─────────────────────────────────────────────────
@@ -137,25 +182,17 @@ def _ukf_predict(
     control_fn: object,
     t0: float,
 ) -> NeuroFilterState:
-    mu = state.mean
-    P  = state.cov
+    # Generate sigma points via eigh (PSD-robust, no Cholesky failure)
+    spts = sigma_points(state.mean, state.cov, _LAM)   # (19, 9)
 
-    # Cholesky decomposition of scaled covariance
-    sqrt_P  = jnp.linalg.cholesky(_N_LAMBDA * P)
-    sp_pos  = mu[None, :] + sqrt_P.T    # (n, STATE_DIM) — n positive sigma pts
-    sp_neg  = mu[None, :] - sqrt_P.T    # (n, STATE_DIM) — n negative sigma pts
-    sigmas  = jnp.concatenate([mu[None, :], sp_pos, sp_neg], axis=0)  # (2n+1, STATE_DIM)
-
-    # Propagate all 19 sigma points through the ODE simultaneously
+    # Propagate all 19 sigma points through the stiff ODE simultaneously
     propagate = jax.vmap(
         lambda x: _transition_sigma(x, params, control_fn, t0)
     )
-    sigmas_f = propagate(sigmas)
+    spts_f = propagate(spts)   # (19, 9)
 
-    mu_pred = jnp.einsum("i,is->s", _WM, sigmas_f)
-    diff    = sigmas_f - mu_pred[None, :]
-    P_pred  = jnp.einsum("i,is,it->st", _WC, diff, diff) + Q
-    P_pred  = 0.5 * (P_pred + P_pred.T)   # enforce symmetry
+    mu_pred, P_pred = unscented_transform(spts_f, Q, _WM, _WC)
+    P_pred = nearest_psd(P_pred)
 
     return NeuroFilterState(mean=mu_pred, cov=P_pred)
 
@@ -168,32 +205,26 @@ def _ukf_update(
     R: jnp.ndarray,
     obs_params: NeuroObsParams,
 ) -> NeuroFilterState:
-    mu = state.mean
-    P  = state.cov
-
-    sqrt_P   = jnp.linalg.cholesky(_N_LAMBDA * P)
-    sp_pos   = mu[None, :] + sqrt_P.T
-    sp_neg   = mu[None, :] - sqrt_P.T
-    sigmas   = jnp.concatenate([mu[None, :], sp_pos, sp_neg], axis=0)
+    spts = sigma_points(state.mean, state.cov, _LAM)   # (19, 9)
 
     obs_fn   = jax.vmap(lambda x: h_neuro(x, obs_params=obs_params))
-    y_sigmas = obs_fn(sigmas)   # (2n+1, OBS_DIM=4)
+    y_sigma  = obs_fn(spts)   # (19, OBS_DIM=4)
 
-    y_mean = jnp.einsum("i,io->o", _WM, y_sigmas)
-    dy     = y_sigmas - y_mean[None, :]
-    dx     = sigmas   - mu[None, :]
+    y_mean, S = unscented_transform(y_sigma, R, _WM, _WC)   # (4,), (4, 4)
 
-    S   = jnp.einsum("i,io,ij->oj", _WC, dy, dy) + R     # (OBS_DIM, OBS_DIM)
-    Pxy = jnp.einsum("i,is,io->so", _WC, dx, dy)         # (STATE_DIM, OBS_DIM)
+    dx  = spts  - state.mean[None, :]    # (19, 9)
+    dy  = y_sigma - y_mean[None, :]      # (19, 4)
+    Pxy = jnp.einsum("i,is,io->so", _WC, dx, dy)   # (9, 4)
 
     K      = Pxy @ jnp.linalg.inv(S)
     innov  = y_obs - y_mean
-    mu_new = mu + K @ innov
-    P_new  = P - K @ S @ K.T
-    P_new  = 0.5 * (P_new + P_new.T)
+    mu_new = state.mean + K @ innov
+    P_new  = state.cov  - K @ S @ K.T
+    P_new  = nearest_psd(P_new)
 
-    # Thermodynamic clamp — concentrations cannot be negative
-    mu_new = _clamp_physical(mu_new)
+    # Truncated-normal clamp: hormones ≥ 0
+    mu_new, P_new = _apply_hormone_clamps(mu_new, P_new)
+    P_new = variance_floor(P_new, _VAR_FLOOR)
 
     return NeuroFilterState(mean=mu_new, cov=P_new)
 
@@ -211,7 +242,7 @@ def update_state(
     t0: float = 8.0,
 ) -> NeuroFilterState:
     """
-    Full UKF cycle: 1-h Kvaerno5 ODE predict → 4-channel observation update.
+    Full TUKF cycle: 1-h Kvaerno5 ODE predict → 4-channel observation update.
 
     Fail-Loud:
       • NaN in posterior mean   → RuntimeError("NeuroUKF: divergence …")
@@ -294,7 +325,7 @@ def filter_history(
     t_start: float = 8.0,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Run UKF for T hourly steps.
+    Run TUKF for T hourly steps.
 
     Parameters
     ----------

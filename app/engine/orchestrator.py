@@ -140,6 +140,28 @@ from app.slices.gonadal_axis.filter import (
 )
 from app.slices.gonadal_axis.female_ode import X0_FEMALE_DEFAULT, P0_FEMALE_DEFAULT
 from app.slices.gonadal_axis.male_ode import X0_MALE_DEFAULT, P0_MALE_DEFAULT
+from app.slices.gastrointestinal.filter import (
+    GastrointestinalStateFilter,
+    GITransitionParams,
+    DEFAULT_TRANSITION_PARAMS as DEFAULT_GI_TRANSITION_PARAMS,
+)
+from app.slices.gastrointestinal.ode import (
+    DEFAULT_GI_PARAMS,
+    X0_GI_DEFAULT, P0_GI_DEFAULT,
+    IDX_INTST_GLU as GI_IDX_INTST_GLU,
+    IDX_INTST_FRU as GI_IDX_INTST_FRU,
+    compute_gi_hub_exports,
+)
+from app.slices.neural_cognitive.filter import (
+    NeuralCognitiveStateFilter,
+    NeuralCogTransitionParams,
+)
+from app.slices.neural_cognitive.ode import (
+    DEFAULT_NC_PARAMS,
+    X0_NC_DEFAULT, P0_NC_DEFAULT,
+    IDX_CAR as NC_IDX_CAR,
+    compute_nc_hub_exports,
+)
 
 # Reference plasma volume for pv_drop_pct computation
 _TR_PV_REF: float = DEFAULT_TR_PARAMS.PV_ref   # 4.2 L
@@ -605,6 +627,399 @@ class SlowAxisOrchestrator:
         )
 
         return SlowAxisState(gonadal=gonadal_state, hub=hub_t1)
+
+
+# ── Hepta state container ─────────────────────────────────────────────────────
+
+class HeptaState(NamedTuple):
+    """
+    Immutable snapshot of the seven-slice state at a single timestep.
+
+    Fields
+    ------
+    nm           : GaussianState -- NM Tissue (6-state, minutes timescale)
+    mg           : GaussianState -- Metabolic Glucose (5-state, minutes timescale)
+    neuro        : GaussianState -- Neuroendocrine (9-state, hourly ODE; 1-min filter steps)
+    thermo_renal : GaussianState -- Thermo-Renal (5-state, minutes timescale)
+    cardio       : GaussianState -- Cardiorespiratory (8-state, minutes timescale)
+    gastro       : GaussianState -- Gastrointestinal (6-state, minutes timescale)
+    neural_cog   : GaussianState -- Neural/Cognitive (7-state, hours timescale)
+    hub          : HubState      -- All inter-slice Gaussian messages
+    """
+    nm:           GaussianState
+    mg:           GaussianState
+    neuro:        GaussianState
+    thermo_renal: GaussianState
+    cardio:       GaussianState
+    gastro:       GaussianState
+    neural_cog:   GaussianState
+    hub:          HubState
+
+
+# ── HeptaOrchestrator ─────────────────────────────────────────────────────────
+
+class HeptaOrchestrator:
+    """
+    Parallel Federated Filtering orchestrator for seven intra-session subsystems:
+        NM || MG || Neuroendocrine || ThermoRenal || Cardio || GI || Neural-Cog.
+
+    ARCHITECTURE: same Parallel co-simulation invariant as PentaOrchestrator.
+    All seven subsystems advance from a FROZEN hub snapshot at time t.
+    Hub(t+1) is reconstructed once from all seven posteriors -- no cascading.
+
+    NEW COUPLINGS vs PentaOrchestrator
+    ------------------------------------
+    GI -> MG  : hub.cho_absorption -- MG reads absorbed CHO from GI (t-1)
+                instead of the mechanical control "cho_abs_g_min".
+    GI -> TR  : hub.fluid_absorbed  -- TR reads absorbed water from GI (t-1)
+                instead of the raw drinking rate from controls.
+    NC -> hub : hub.nc_car          -- Central Activation Ratio published for
+                downstream NM coupling in future sprints.
+
+    Stale-by-1-step error bounds:
+        GI absorption (tau ~ 2-5 min)   : |err| < 0.20-0.50   ACCEPTABLE (1-min dt)
+        TR fluid (tau ~ 30 min via PV)  : |err| < 0.03         SAFE
+        NC CAR (tau ~ 30 min)           : |err| < 0.03         SAFE
+
+    Controls dict expected keys (on top of PentaOrchestrator keys):
+        "gi_glu_in_g_min"        float [g/min]    glucose ingestion rate
+        "gi_fru_in_g_min"        float [g/min]    fructose ingestion rate
+        "hub_sodium_mmolL"       float [mmol/L]   plasma sodium (default 140)
+        "hub_sleep_debt"         float [au]        sleep debt for NC
+        "hub_metabolic_stress"   float [0-1]       metabolic stress for NC
+        "caffeine_intake_plasma" float [mg/L/h]    caffeine absorption for NC
+
+    Typical usage
+    -------------
+    orch  = HeptaOrchestrator()
+    state = HeptaOrchestrator.default_state()
+    state = orch.step(
+        prior    = state,
+        controls = {"power_W": 200.0, "hub_fluid_intake_L_min": 0.008,
+                    "hub_sodium_intake_mmol_min": 0.4,
+                    "gi_glu_in_g_min": 0.5, "gi_fru_in_g_min": 0.2, ...},
+    )
+    """
+
+    def __init__(
+        self,
+        nm_filter:     NMv4Filter                  | None = None,
+        mg_filter:     MetabolicGlucoseFilter       | None = None,
+        neuro_params:  NeuroParams                  | None = None,
+        tr_filter:     ThermoRenalStateFilter       | None = None,
+        cardio_filter: CardioStateFilter            | None = None,
+        cardio_params: CardioTransitionParams       | None = None,
+        gi_filter:     GastrointestinalStateFilter  | None = None,
+        nc_filter:     NeuralCognitiveStateFilter   | None = None,
+    ) -> None:
+        self.nm_filt      = nm_filter     or NMv4Filter()
+        self.mg_filt      = mg_filter     or MetabolicGlucoseFilter()
+        self.neuro_params = neuro_params  or DEFAULT_NEURO_PARAMS
+        self.neuro_Q      = neuro_default_Q()
+        self.tr_filt      = tr_filter     or ThermoRenalStateFilter()
+        self.cardio_flt   = cardio_filter or CardioStateFilter()
+        self.cardio_prms  = cardio_params or DEFAULT_TRANSITION_PARAMS
+        self.gi_filt      = gi_filter     or GastrointestinalStateFilter()
+        self.nc_filt      = nc_filter     or NeuralCognitiveStateFilter()
+
+    @staticmethod
+    def default_state() -> HeptaState:
+        """Population-prior cold-start state for all seven subsystems."""
+        neuro_fs = neuro_initial_filter_state()
+        return HeptaState(
+            nm           = GaussianState(mean=X0_NM_V4,         cov=P0_NM_V4),
+            mg           = GaussianState(mean=X0_MG,             cov=P0_MG),
+            neuro        = GaussianState(mean=neuro_fs.mean,     cov=neuro_fs.cov),
+            thermo_renal = GaussianState(mean=X0_TR_DEFAULT,     cov=P0_TR_DEFAULT),
+            cardio       = GaussianState(mean=X0_CARDIO_DEFAULT, cov=P0_CARDIO_DEFAULT),
+            gastro       = GaussianState(mean=X0_GI_DEFAULT,     cov=P0_GI_DEFAULT),
+            neural_cog   = GaussianState(mean=X0_NC_DEFAULT,     cov=P0_NC_DEFAULT),
+            hub          = default_hub_state(),
+        )
+
+    def step(
+        self,
+        prior:         HeptaState,
+        controls:      dict[str, float],
+        obs_nm:        dict[str, object] | None = None,
+        obs_mg:        dict[str, object] | None = None,
+        obs_neuro:     dict[str, object] | None = None,
+        obs_thermo:    dict[str, float]  | None = None,
+        obs_cardio:    dict[str, float]  | None = None,
+        obs_gi:        dict[str, float]  | None = None,
+        obs_nc:        dict[str, float]  | None = None,
+        cardio_params: CardioTransitionParams | None = None,
+        dt_real:       float = 1.0,
+    ) -> HeptaState:
+        """
+        Advance the hepta-system by dt_real minutes using parallel co-simulation.
+
+        All seven filters receive the same frozen hub snapshot from time t.
+        Hub(t+1) is assembled once from all seven posteriors -- no intra-step
+        cascade. Causal ordering is preserved: hub_{t+1} is a pure function
+        of {organ_posteriors(t+1)} which are pure functions of {prior_states(t),
+        hub_t, controls_t}.
+
+        Parameters
+        ----------
+        prior       : HeptaState from the previous timestep
+        controls    : dict -- see class docstring for full key list
+        obs_gi      : {"nausea_obs", "bloating_obs", "quality_flags"} -- default NaN
+        obs_nc      : {"rpe_proxy", "pvt_lapses", "quality_flags"}    -- default NaN
+        (other obs_ keys same as PentaOrchestrator.step)
+        dt_real     : integration window [min]; default 1.0
+
+        Returns
+        -------
+        HeptaState with updated posteriors and hub.
+        """
+        if obs_nm     is None: obs_nm     = {}
+        if obs_mg     is None: obs_mg     = {}
+        if obs_neuro  is None: obs_neuro  = {}
+        if obs_thermo is None: obs_thermo = {}
+        if obs_cardio is None: obs_cardio = {}
+        if obs_gi     is None: obs_gi     = {}
+        if obs_nc     is None: obs_nc     = {}
+        c_params = cardio_params or self.cardio_prms
+
+        # ── (A) SNAPSHOT: freeze hub at time t ───────────────────────────────
+        hub_t = prior.hub
+
+        # Extract controls
+        power_W        = float(controls.get("power_W",                    0.0))
+        hub_circ_phase = float(controls.get("hub_circadian_phase",         0.0))
+        hub_sws        = float(controls.get("hub_sleep_sws",               0.0))
+        hub_fluid      = float(controls.get("hub_fluid_intake_L_min",      0.0))
+        hub_na_in      = float(controls.get("hub_sodium_intake_mmol_min",  0.0))
+
+        # Read hub_t snapshot with NaN guards (physiological defaults)
+        glc_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.plasma_glucose),    nan=90.0))
+        lac_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.plasma_lactate),    nan=1.0))
+        gly_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.local_gly_norm),    nan=1.0))
+        epi_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.epinephrine),       nan=50.0))
+        cort_t   = float(jnp.nan_to_num(msg_to_mean(hub_t.cortisol),          nan=300.0))
+        tcore_t  = float(jnp.nan_to_num(msg_to_mean(hub_t.core_temp),         nan=37.0))
+        pvdrop_t = float(jnp.nan_to_num(msg_to_mean(hub_t.pv_drop_pct),       nan=0.0))
+        il6_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.il6),               nan=1.0))
+        bto_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.basal_temp_offset),  nan=0.0))
+        # GI -> MG: absorbed CHO from previous GI step (replaces mechanical cho_abs_g_min)
+        cho_abs_t = float(jnp.nan_to_num(msg_to_mean(hub_t.cho_absorption),   nan=0.0))
+        # GI -> TR: absorbed fluid from previous GI step (replaces raw drinking rate)
+        fluid_abs_t = float(jnp.nan_to_num(msg_to_mean(hub_t.fluid_absorbed), nan=hub_fluid))
+
+        # ── (B) PARALLEL BLOCK: all seven organs read hub_t ───────────────────
+        #        none reads another organ's same-step output
+        # ─────────────────────────────────────────────────────────────────────
+
+        # NM: reads plasma_glucose(t-1), plasma_lactate(t-1)
+        nm_u = jnp.array([power_W, lac_t, glc_t], dtype=jnp.float32)
+        nm_state = self.nm_filt.update_state(
+            prior         = prior.nm,
+            emg_mV        = float(obs_nm.get("emg_mV",   math.nan)),
+            smo2_pct      = float(obs_nm.get("smo2_pct", math.nan)),
+            u             = nm_u,
+            quality_flags = obs_nm.get("quality_flags", (4, 4)),
+        )
+
+        # MG: reads local_gly_norm(t-1), epinephrine(t-1), cortisol(t-1)
+        # KEY CHANGE vs Penta: cho_abs comes from hub_t.cho_absorption (GI t-1)
+        mg_hubs = jnp.array(
+            [cho_abs_t, epi_t, cort_t, power_W, gly_t],
+            dtype=jnp.float32,
+        )
+        mg_state = self.mg_filt.update_state(
+            prior        = prior.mg,
+            cgm_reading  = float(obs_mg.get("cgm_reading", math.nan)),
+            hubs         = mg_hubs,
+            quality_flag = int(obs_mg.get("quality_flag", 4)),
+        )
+
+        # Neuro: reads plasma_glucose(t-1), IL6(t-1)
+        training_stress = float(jnp.clip(
+            jnp.float32(power_W) / jnp.float32(400.0), 0.0, 1.0
+        ))
+        neuro_ctrl = lambda t: jnp.array([    # noqa: E731
+            training_stress,
+            hub_circ_phase,
+            il6_t,
+            glc_t,
+            hub_sws,
+        ], dtype=jnp.float32)
+
+        from app.slices.neuroendocrine.observation import h_neuro as _h_neuro
+        neuro_state_in = NeuroFilterState(mean=prior.neuro.mean, cov=prior.neuro.cov)
+        neuro_qflag = int(obs_neuro.get("quality_flag", 4))
+        y_neuro = _h_neuro(prior.neuro.mean, obs_params=NEURO_DEFAULT_OBS_PARAMS)
+        if "y_obs" in obs_neuro:
+            y_neuro = jnp.array(obs_neuro["y_obs"], dtype=jnp.float32)
+
+        neuro_result = neuro_update_state(
+            state        = neuro_state_in,
+            y_obs        = y_neuro,
+            params       = self.neuro_params,
+            obs_params   = NEURO_DEFAULT_OBS_PARAMS,
+            Q            = self.neuro_Q,
+            quality_flag = neuro_qflag,
+            control_fn   = neuro_ctrl,
+            t0           = float(controls.get("t_hour", 8.0)),
+        )
+        neuro_state = GaussianState(mean=neuro_result.mean, cov=neuro_result.cov)
+
+        # TR: KEY CHANGE vs Penta: reads fluid_absorbed from hub (GI t-1)
+        tr_state = self.tr_filt.update_state(
+            prior         = prior.thermo_renal,
+            core_temp_obs = float(obs_thermo.get("core_temp_obs", math.nan)),
+            bw_drop_obs   = float(obs_thermo.get("bw_drop_obs",   math.nan)),
+            controls      = {
+                "hub_power_watts":            power_W,
+                "hub_fluid_intake_L_min":     fluid_abs_t,   # from GI hub
+                "hub_sodium_intake_mmol_min": hub_na_in,
+                "hub_basal_temp_offset":      bto_t,
+            },
+            dt_minutes    = dt_real,
+            quality_flags = obs_thermo.get("quality_flags", (4, 4)),
+        )
+
+        # Cardio: reads core_temp(t-1), pv_drop_pct(t-1)
+        cardio_state = self.cardio_flt.update_state(
+            prior        = prior.cardio,
+            observations = obs_cardio,
+            controls     = {
+                "power_watts":     power_W,
+                "hub_T_core":      tcore_t,
+                "hub_pv_drop_pct": pvdrop_t,
+            },
+            params   = c_params,
+            dt_real  = dt_real,
+        )
+
+        # GI: reads core_temp, power from hub_t; fluid/sugar/sodium from controls
+        gi_controls = {
+            "Fluid_in":     float(controls.get("hub_fluid_intake_L_min",   0.0)),
+            "Glu_in":       float(controls.get("gi_glu_in_g_min",           0.0)),
+            "Fru_in":       float(controls.get("gi_fru_in_g_min",           0.0)),
+            "Power":        power_W,
+            "Temp":         tcore_t,
+            "Sodium_mmolL": float(controls.get("hub_sodium_mmolL",        140.0)),
+        }
+        gi_state = self.gi_filt.update_state(
+            prior         = prior.gastro,
+            controls      = gi_controls,
+            dt_minutes    = dt_real,
+            nausea_obs    = float(obs_gi.get("nausea_obs",   math.nan)),
+            bloating_obs  = float(obs_gi.get("bloating_obs", math.nan)),
+            quality_flags = obs_gi.get("quality_flags", (4, 4)),
+        )
+
+        # NC: reads hub_T_core, il6, and controls (sleep, stress, caffeine)
+        # dt_hours = dt_real / 60.0 (NC ODE runs in hours)
+        dt_nc_hours = dt_real / 60.0
+        hypo_signal = float(jnp.clip(
+            jnp.float32(1.0) - jnp.float32(glc_t) / jnp.float32(70.0),
+            jnp.float32(0.0),
+            jnp.float32(1.0),
+        ))
+        nc_controls = {
+            "hub_training_stress":    training_stress,
+            "hub_muscle_damage":      0.0,
+            "hub_T_core":             tcore_t,
+            "hub_sleep_debt":         float(controls.get("hub_sleep_debt",         0.0)),
+            "hub_IL6":                il6_t,
+            "hub_metabolic_stress":   float(controls.get("hub_metabolic_stress",   0.0)),
+            "caffeine_intake_plasma": float(controls.get("caffeine_intake_plasma", 0.0)),
+            "hub_hypoglycemia":       hypo_signal,
+        }
+        nc_state = self.nc_filt.update_state(
+            prior         = prior.neural_cog,
+            controls      = nc_controls,
+            dt_hours      = dt_nc_hours,
+            rpe_proxy     = float(obs_nc.get("rpe_proxy",  math.nan)),
+            pvt_lapses    = float(obs_nc.get("pvt_lapses", math.nan)),
+            quality_flags = obs_nc.get("quality_flags", (4, 4)),
+        )
+
+        # ── (C) HUB RECONSTRUCTION at t+1 ────────────────────────────────────
+        # All seven organs publish their marginals simultaneously.
+        # Single _replace call: hub_t -> hub_{t+1}.
+
+        # NM publishes: local_gly_norm
+        gly_mean = float(nm_state.mean[NM_IDX_GLYCOGEN])
+        gly_var  = float(nm_state.cov[NM_IDX_GLYCOGEN, NM_IDX_GLYCOGEN])
+
+        # MG publishes: plasma_glucose, plasma_lactate
+        g_mean   = float(mg_state.mean[MG_IDX_G])
+        g_var    = float(mg_state.cov[MG_IDX_G, MG_IDX_G])
+        lac_mean = float(mg_state.mean[MG_IDX_LAC])
+        lac_var  = float(mg_state.cov[MG_IDX_LAC, MG_IDX_LAC])
+
+        # Neuro publishes: cortisol, epinephrine
+        cort_mean = float(neuro_state.mean[NEURO_IDX_CORT])
+        cort_var  = float(neuro_state.cov[NEURO_IDX_CORT, NEURO_IDX_CORT])
+        epi_mean  = float(neuro_state.mean[NEURO_IDX_EPI])
+        epi_var   = float(neuro_state.cov[NEURO_IDX_EPI, NEURO_IDX_EPI])
+
+        # TR publishes: core_temp, pv_drop_pct
+        tcore_mean  = float(tr_state.mean[TR_IDX_CORE_TEMP])
+        tcore_var   = float(tr_state.cov[TR_IDX_CORE_TEMP, TR_IDX_CORE_TEMP])
+        pv_mean     = float(tr_state.mean[TR_IDX_PLASMA_VOL])
+        pv_var      = float(tr_state.cov[TR_IDX_PLASMA_VOL, TR_IDX_PLASMA_VOL])
+        pv_drop     = float(jnp.clip(
+            jnp.float32(100.0) * (jnp.float32(_TR_PV_REF) - jnp.float32(pv_mean)) / jnp.float32(_TR_PV_REF),
+            jnp.float32(0.0), jnp.float32(50.0),
+        ))
+        pv_drop_var = (100.0 / _TR_PV_REF) ** 2 * pv_var
+
+        # Cardio publishes: autonomic_tone
+        at_mean = float(cardio_state.mean[CARDIO_IDX_AT])
+        at_var  = float(cardio_state.cov[CARDIO_IDX_AT, CARDIO_IDX_AT])
+
+        # GI publishes: cho_absorption, fluid_absorbed (algebraic from posterior)
+        u_gi_for_export = jnp.array([
+            float(gi_controls["Fluid_in"]),
+            float(gi_controls["Glu_in"]),
+            float(gi_controls["Fru_in"]),
+            float(gi_controls["Power"]),
+            float(gi_controls["Temp"]),
+            float(gi_controls["Sodium_mmolL"]),
+        ], dtype=jnp.float32)
+        gi_exports   = compute_gi_hub_exports(gi_state.mean, u_gi_for_export, DEFAULT_GI_PARAMS)
+        cho_abs_mean = float(gi_exports["cho_absorption_g_min"])
+        cho_abs_var  = float(
+            gi_state.cov[GI_IDX_INTST_GLU, GI_IDX_INTST_GLU]
+            + gi_state.cov[GI_IDX_INTST_FRU, GI_IDX_INTST_FRU]
+        )
+        fl_abs_mean  = float(gi_exports["fluid_absorbed_L_min"])
+        fl_abs_var   = float(gi_state.cov[0, 0])  # Stom_Fluid variance as proxy
+
+        # NC publishes: nc_car (central activation ratio)
+        nc_exports  = compute_nc_hub_exports(nc_state.mean, DEFAULT_NC_PARAMS)
+        nc_car_mean = float(nc_exports["Hub_NC_CAR"])
+        nc_car_var  = float(nc_state.cov[NC_IDX_CAR, NC_IDX_CAR])
+
+        hub_t1 = hub_t._replace(
+            local_gly_norm = nm_glycogen_to_hub(gly_mean, gly_var),
+            plasma_glucose = msg_from_scalar(g_mean,       g_var      + 1e-8),
+            plasma_lactate = msg_from_scalar(lac_mean,     lac_var    + 1e-8),
+            cortisol       = msg_from_scalar(cort_mean,    cort_var   + 1e-8),
+            epinephrine    = msg_from_scalar(epi_mean,     epi_var    + 1e-8),
+            core_temp      = msg_from_scalar(tcore_mean,   tcore_var  + 1e-8),
+            pv_drop_pct    = msg_from_scalar(pv_drop,      pv_drop_var + 1e-8),
+            autonomic_tone = msg_from_scalar(at_mean,      at_var     + 1e-8),
+            cho_absorption = msg_from_scalar(cho_abs_mean, cho_abs_var + 1e-8),
+            fluid_absorbed = msg_from_scalar(fl_abs_mean,  fl_abs_var  + 1e-8),
+            nc_car         = msg_from_scalar(nc_car_mean,  nc_car_var  + 1e-8),
+        )
+
+        return HeptaState(
+            nm           = nm_state,
+            mg           = mg_state,
+            neuro        = neuro_state,
+            thermo_renal = tr_state,
+            cardio       = cardio_state,
+            gastro       = gi_state,
+            neural_cog   = nc_state,
+            hub          = hub_t1,
+        )
 
 
 # ── Legacy alias ──────────────────────────────────────────────────────────────

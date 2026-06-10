@@ -1,7 +1,7 @@
 """
-app/slices/gastrointestinal/filter.py  --  GI Slice V3.0
+app/slices/gastrointestinal/filter.py  --  GI Slice V4.0 (TUKF Gold Standard)
 
-L4 UKF  --  6-state, dt_minutes=1.0, alpha=0.10 MANDATORY.
+L4 TUKF  --  6-state, dt_minutes=1.0, alpha=0.10.
 
 n=6, alpha=0.10, beta=2, kappa=0:
   lambda = 0.01*6 - 6 = -5.94
@@ -10,9 +10,14 @@ n=6, alpha=0.10, beta=2, kappa=0:
   WC_0 = -99 + (1-0.01+2) = -96.01
   WI   = 0.5/0.06 = 8.3333
 
-Post-predict  : clamp jnp.maximum(x, 0) + jitter _JITTER*I.
-Post-update   : floor diagonal at _COV_FLOOR.
-Fail-Loud     : RuntimeError on NaN posterior_mean or negative cov diagonal.
+TUKF Blindage (Simon 2010):
+  sigma_points  : eigh-based (PSD-robust), shared from ukf_filter.py.
+  Post-predict  : Q scaled by dt_minutes (Wiener scaling).
+  Post-update   : _apply_physical_clamps_gi:
+                    lower_clamp_moments(lb=0.0) for all 5 mass/volume dims.
+                    range_clamp_moments([0,1]) for GI_Distress.
+                    variance_floor + nearest_psd.
+  Fail-Loud     : RuntimeError on NaN posterior_mean or non-PSD diagonal.
 """
 from __future__ import annotations
 
@@ -36,36 +41,53 @@ from app.slices.gastrointestinal.ode import (
     X0_GI_DEFAULT, P0_GI_DEFAULT,
     STATE_DIM, CTRL_DIM,
     gi_ode,
+    IDX_STOM_FLUID, IDX_STOM_GLU, IDX_STOM_FRU,
+    IDX_INTST_GLU, IDX_INTST_FRU, IDX_DISTRESS,
 )
 from app.slices.gastrointestinal.observation import (
     GIObsParams, DEFAULT_GI_OBS_PARAMS,
     OBS_DIM, h_gi, h_gi_sigma,
     R_GI_DEFAULT, inflate_R_gi,
 )
-from app.engine.assimilation.ukf_filter import GaussianState
+from app.engine.assimilation.ukf_filter import (
+    GaussianState,
+    nearest_psd,
+    variance_floor,
+    ukf_weights,
+    sigma_points,
+    unscented_transform,
+    scale_Q,
+    lower_clamp_moments,
+    range_clamp_moments,
+    clamp_dim,
+)
 
 logger = logging.getLogger(__name__)
 
-# ── UKF weights (alpha=0.10, n=6) ────────────────────────────────────────────
+# ── UKF Merwe-Wan weights (alpha=0.10, n=6) ───────────────────────────────────
+# float32-safe: Wm[0] = -99.0, no catastrophic cancellation.
+# See ukf_filter.py module docstring for the full float32 safety analysis.
+
 _ALPHA: float = 0.10
 _BETA:  float = 2.0
 _KAPPA: float = 0.0
 _N:     int   = STATE_DIM   # 6
 
-_LAM:   float = _ALPHA**2 * (_N + _KAPPA) - _N   # -5.94
-_NL:    float = _N + _LAM                          #  0.06
+_WM, _WC, _LAM = ukf_weights(_N, _ALPHA, _BETA, _KAPPA)
 
-_WM_0:  float = _LAM / _NL           # -99.0
-_WC_0:  float = _WM_0 + (1.0 - _ALPHA**2 + _BETA)  # -96.01
-_WI:    float = 0.5 / _NL            #  8.3333
+# ── Simon 2010 variance floor (Section 5.4) ───────────────────────────────────
 
-_WM: jax.Array = jnp.array([_WM_0] + [_WI] * (2 * _N), dtype=jnp.float32)
-_WC: jax.Array = jnp.array([_WC_0] + [_WI] * (2 * _N), dtype=jnp.float32)
+_VAR_FLOOR: jax.Array = jnp.array([
+    1e-6,   # Stomach_Fluid_L   (0.001 L)^2
+    1e-4,   # Stom_Glu_g        (0.01 g)^2
+    1e-4,   # Stom_Fru_g        (0.01 g)^2
+    1e-4,   # Intst_Glu_g       (0.01 g)^2
+    1e-4,   # Intst_Fru_g       (0.01 g)^2
+    1e-6,   # GI_Distress_au    (0.001)^2
+], dtype=jnp.float32)
 
-_JITTER:    jax.Array = jnp.float32(1e-3)
-_COV_FLOOR: jax.Array = jnp.float32(1e-3)
+# ── Process noise Q (diagonal, per minute) ────────────────────────────────────
 
-# ── Process noise Q (diagonal, per minute) ───────────────────────────────────
 _Q_DIAG: jax.Array = jnp.array([
     2.5e-3,   # Stomach_Fluid_L  (0.05 L/min)^2
     0.09,     # Stom_Glu_g       (0.3 g/min)^2
@@ -86,7 +108,7 @@ class GITransitionParams(NamedTuple):
 DEFAULT_TRANSITION_PARAMS: GITransitionParams = GITransitionParams()
 
 
-# ── ODE step (vmap-compatible) ────────────────────────────────────────────────
+# ── JIT-safe 1-min ODE step (vmap-compatible) ─────────────────────────────────
 
 def _integrate_1min(
     x:      jax.Array,
@@ -104,49 +126,72 @@ def _integrate_1min(
         saveat   = diffrax.SaveAt(t1=True),
         max_steps= 256,
     )
-    return jnp.maximum(sol.ys[0], jnp.float32(0.0))
+    return sol.ys[0]
 
 
-# ── sigma-point helpers ───────────────────────────────────────────────────────
+# ── Physical clamps (Simon 2010 truncated-normal) ─────────────────────────────
 
-def _sigma_points(mean: jax.Array, cov: jax.Array) -> jax.Array:
-    """Merwe-Wan 2n+1 sigma points.  Returns (2n+1, n)."""
-    n = mean.shape[0]
-    # add small regularisation before Cholesky
-    cov_reg = jnp.float32(_NL) * (cov + jnp.float32(1e-7) * jnp.eye(n, dtype=jnp.float32))
-    L = jnp.linalg.cholesky(cov_reg)
-    return jnp.concatenate(
-        [mean[None, :], mean[None, :] + L.T, mean[None, :] - L.T], axis=0
-    )
-
-
-def _recover_mean_cov(
-    pts:       jax.Array,
-    noise_cov: jax.Array,
+def _apply_physical_clamps_gi(
+    mean: jax.Array,
+    cov:  jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    mean = jnp.einsum("i,ij->j", _WM, pts)
-    diff = pts - mean[None, :]
-    cov  = jnp.einsum("i,ij,ik->jk", _WC, diff, diff) + noise_cov
+    """
+    Gaussian-coherent physical clamping for all 6 GI states.
+
+    Step 1 -- truncated-normal moment matching per constrained dimension:
+        Stom_Fluid, Stom_Glu, Stom_Fru, Intst_Glu, Intst_Fru  >= 0
+        GI_Distress                                              in [0, 1]
+
+    Step 2 -- variance floor (Simon 2010 Section 5.4).
+    Step 3 -- nearest_psd repair (Higham 1988).
+    """
+    for dim in [IDX_STOM_FLUID, IDX_STOM_GLU, IDX_STOM_FRU,
+                IDX_INTST_GLU,  IDX_INTST_FRU]:
+        m, v = lower_clamp_moments(mean[dim], cov[dim, dim], 0.0)
+        mean, cov = clamp_dim(mean, cov, dim, m, v)
+
+    m, v = range_clamp_moments(mean[IDX_DISTRESS], cov[IDX_DISTRESS, IDX_DISTRESS], 0.0, 1.0)
+    mean, cov = clamp_dim(mean, cov, IDX_DISTRESS, m, v)
+
+    cov = variance_floor(cov, _VAR_FLOOR)
+    cov = nearest_psd(cov)
     return mean, cov
 
 
+# ── Pure-JAX UKF kernels ───────────────────────────────────────────────────────
+
 @jax.jit
-def _ukf_predict(
+def _ukf_predict_gi(
     mean:   jax.Array,
     cov:    jax.Array,
     u:      jax.Array,
     params: GITransitionParams,
     Q:      jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    sigma      = _sigma_points(mean, cov)
-    sigma_next = jax.vmap(_integrate_1min, in_axes=(0, None, None))(sigma, u, params)
-    mean_p, cov_p = _recover_mean_cov(sigma_next, Q)
-    cov_p = cov_p + _JITTER * jnp.eye(STATE_DIM, dtype=jnp.float32)
-    return mean_p, cov_p
+    """
+    UKF predict: eigh-based sigma points through the 1-min GI ODE.
+
+    Q must be pre-scaled to dt_real (via scale_Q) before calling.
+
+    Parameters
+    ----------
+    mean   : (STATE_DIM,)
+    cov    : (STATE_DIM, STATE_DIM)
+    u      : (CTRL_DIM,)
+    params : GITransitionParams
+    Q      : (STATE_DIM, STATE_DIM) — dt-scaled process noise
+
+    Returns
+    -------
+    (mean_pred, cov_pred)
+    """
+    pts      = sigma_points(mean, cov, _LAM)
+    pts_next = jax.vmap(_integrate_1min, in_axes=(0, None, None))(pts, u, params)
+    return unscented_transform(pts_next, Q, _WM, _WC)
 
 
 @jax.jit
-def _ukf_update(
+def _ukf_update_gi(
     mean_pred:  jax.Array,
     cov_pred:   jax.Array,
     y_obs:      jax.Array,
@@ -154,36 +199,54 @@ def _ukf_update(
     gi_params:  GIv3Params,
     R:          jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    sigma  = _sigma_points(mean_pred, cov_pred)
-    y_sig  = h_gi_sigma(sigma, obs_params, gi_params)
+    """
+    UKF measurement update for GI [Nausea_VAS, Bloating_VAS].
 
-    y_mean = jnp.einsum("i,ij->j", _WM, y_sig)
-    dy_s   = y_sig  - y_mean[None, :]
-    dx_s   = sigma  - mean_pred[None, :]
+    Parameters
+    ----------
+    mean_pred  : (STATE_DIM,)
+    cov_pred   : (STATE_DIM, STATE_DIM)
+    y_obs      : (OBS_DIM,) = (2,)
+    obs_params : GIObsParams
+    gi_params  : GIv3Params
+    R          : (OBS_DIM, OBS_DIM) — per-channel inflated noise
 
-    S_yy = jnp.einsum("i,ij,ik->jk", _WC, dy_s, dy_s) + R
-    P_xy = jnp.einsum("i,ij,ik->jk", _WC, dx_s, dy_s)
+    Returns
+    -------
+    (posterior_mean, posterior_cov)
+    """
+    pts    = sigma_points(mean_pred, cov_pred, _LAM)
+    y_pts  = h_gi_sigma(pts, obs_params, gi_params)
+
+    y_mean = jnp.einsum("i,ij->j", _WM, y_pts)
+    dy     = y_pts - y_mean[None, :]
+    dx     = pts   - mean_pred[None, :]
+
+    S_yy   = jnp.einsum("i,ij,ik->jk", _WC, dy, dy) + R
+    P_xy   = jnp.einsum("i,ij,ik->jk", _WC, dx, dy)
 
     K          = P_xy @ jnp.linalg.inv(S_yy)
     innovation = y_obs - y_mean
     post_mean  = mean_pred + K @ innovation
-    post_cov   = cov_pred - K @ S_yy @ K.T
-
-    # floor diagonal at _COV_FLOOR
-    diag_vals = jnp.diag(post_cov)
-    deficit   = jnp.maximum(_COV_FLOOR - diag_vals, jnp.float32(0.0))
-    post_cov  = post_cov + jnp.diag(deficit)
+    post_cov   = cov_pred  - K @ S_yy @ K.T
 
     return post_mean, post_cov
 
 
-# ── Public filter ─────────────────────────────────────────────────────────────
+# ── Public filter ──────────────────────────────────────────────────────────────
 
 class GastrointestinalStateFilter:
     """
-    L4 UKF for GI V3.0 -- 6-state, alpha=0.10, dt_minutes=1.0.
+    L4 TUKF for GI V4.0 -- 6-state, alpha=0.10, dt_minutes=1.0.
 
-    Observations: [Nausea_VAS, Bloating_VAS]  (VAS 0-10).
+    Observations: [Nausea_VAS, Bloating_VAS] (VAS 0-10).
+
+    TUKF blindage (Simon 2010):
+        sigma_points : eigh-based (robust to float32 non-PSD drift).
+        lower_clamp_moments(lb=0.0) for all 5 mass/volume dimensions.
+        range_clamp_moments([0,1]) for GI_Distress_au.
+        variance_floor + nearest_psd after every update.
+        Q scaled by dt_minutes (Wiener scaling).
     """
 
     def __init__(
@@ -212,9 +275,27 @@ class GastrointestinalStateFilter:
         params:        GITransitionParams | None = None,
     ) -> GaussianState:
         """
-        One UKF step (predict + update).
+        One TUKF step (predict + update + physical clamps).
 
-        quality_flags: (flag_nausea, flag_bloating); 4 -> predict-only channel.
+        Parameters
+        ----------
+        prior         : GaussianState(mean in R^6, cov in R^6x6)
+        controls      : dict with keys:
+                        'Fluid_in'      [L/min]   fluid ingestion rate
+                        'Glu_in'        [g/min]   glucose intake
+                        'Fru_in'        [g/min]   fructose intake
+                        'Power'         [W]       mechanical output
+                        'Temp'          [degC]    core temperature
+                        'Sodium_mmolL'  [mmol/L]  plasma sodium (default 140)
+        quality_flags : (flag_nausea, flag_bloating); 4 = predict-only channel.
+
+        Returns
+        -------
+        GaussianState -- posterior (mean, cov)
+
+        Raises
+        ------
+        RuntimeError on NaN posterior or non-PSD covariance.
         """
         if params is None:
             params = GITransitionParams(gi=DEFAULT_GI_PARAMS, dt_m=float(dt_minutes))
@@ -230,10 +311,13 @@ class GastrointestinalStateFilter:
             float(controls.get("Sodium_mmolL",  140.0)),
         ], dtype=jnp.float32)
 
-        # ── predict ───────────────────────────────────────────────────────────
-        mean_p, cov_p = _ukf_predict(prior.mean, prior.cov, u, params, self.Q)
+        # ── dt-scaled Q (Wiener scaling) ──────────────────────────────────────
+        Q_step = scale_Q(self.Q, dt_minutes)
 
-        # ── per-channel R inflation ───────────────────────────────────────────
+        # ── Predict ───────────────────────────────────────────────────────────
+        mean_p, cov_p = _ukf_predict_gi(prior.mean, prior.cov, u, params, Q_step)
+
+        # ── Per-channel R inflation ───────────────────────────────────────────
         fn, fb  = quality_flags
         _S      = {0: 1.0, 1: 2.0, 2: 5.0, 3: 20.0, 4: 1e8}
         scale_n = _S.get(fn, 1e8)
@@ -243,18 +327,21 @@ class GastrointestinalStateFilter:
             dtype=jnp.float32,
         )
 
-        # fill missing obs with predicted value (predict-only semantics)
+        # fill missing obs with predicted observation (1e8 R -> zero Kalman gain)
         y_hat = h_gi(mean_p, self.obs_params, params.gi)
         nv    = y_hat[0] if (nausea_obs  != nausea_obs  or fn == 4) else jnp.float32(nausea_obs)
         bv    = y_hat[1] if (bloating_obs != bloating_obs or fb == 4) else jnp.float32(bloating_obs)
         y_obs = jnp.array([nv, bv], dtype=jnp.float32)
 
-        # ── update ────────────────────────────────────────────────────────────
-        post_mean, post_cov = _ukf_update(
+        # ── Update ────────────────────────────────────────────────────────────
+        post_mean, post_cov = _ukf_update_gi(
             mean_p, cov_p, y_obs, self.obs_params, params.gi, R_step
         )
 
-        # ── Fail-Loud ─────────────────────────────────────────────────────────
+        # ── TUKF physical clamps (Simon 2010): moment matching + floor + PSD ──
+        post_mean, post_cov = _apply_physical_clamps_gi(post_mean, post_cov)
+
+        # ── Fail-Loud: divergence detection ───────────────────────────────────
         if bool(jnp.any(jnp.isnan(post_mean))):
             raise RuntimeError(
                 "GastrointestinalStateFilter.update_state: posterior_mean NaN. "
@@ -267,7 +354,6 @@ class GastrointestinalStateFilter:
                 f"diag={diag}"
             )
 
-        post_cov = jnp.float32(0.5) * (post_cov + post_cov.T)
         return GaussianState(mean=post_mean, cov=post_cov)
 
     def build_dynamax_params(

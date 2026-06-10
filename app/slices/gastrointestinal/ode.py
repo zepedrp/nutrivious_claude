@@ -251,3 +251,47 @@ def hub_cho_absorption_rate(
     """Total CHO absorption rate [g/min]."""
     ag, af = _absorption_rates(x, u, params)
     return ag + af
+
+
+@jax.jit
+def compute_gi_hub_exports(
+    x:      jax.Array,
+    u:      jax.Array,
+    params: GIv3Params = DEFAULT_GI_PARAMS,
+) -> dict[str, jax.Array]:
+    """
+    Algebraic hub exports from GI V3 posterior.
+
+    Returns
+    -------
+    cho_absorption_g_min : float [g/min]  — SGLT1+GLUT5 combined absorption rate
+    fluid_absorbed_L_min : float [L/min]  — gastric emptying rate (water to intestine)
+
+    The fluid absorbed is GER * Stom_Fluid, which models the net water transit
+    rate from stomach to small intestine (absorbed into portal circulation).
+    GER depends on osmolality and ischaemia — so hyperosmotic or high-intensity
+    conditions reduce water delivery even if drinking continues.
+    """
+    ag, af = _absorption_rates(x, u, params)
+    cho_abs = ag + af
+
+    stom_fluid = jnp.maximum(x[IDX_STOM_FLUID], jnp.float32(0.0))
+    stom_glu   = jnp.maximum(x[IDX_STOM_GLU],   jnp.float32(0.0))
+    stom_fru   = jnp.maximum(x[IDX_STOM_FRU],   jnp.float32(0.0))
+    density       = (stom_glu + stom_fru) / (stom_fluid + _EPS)
+    density_excess = jnp.maximum(density - jnp.float32(params.osm_threshold), jnp.float32(0.0))
+    osmotic_brake  = jnp.exp(-jnp.float32(params.k_osm) * density_excess)
+
+    power = jnp.maximum(_ng(u[UIDX_POWER], 0.0), jnp.float32(0.0))
+    temp  = _ng(u[UIDX_TEMP], 37.0)
+    pn    = jnp.maximum(power - jnp.float32(params.power_thresh), jnp.float32(0.0)) / jnp.float32(params.power_range)
+    tn    = jnp.maximum(temp  - jnp.float32(params.temp_thresh),  jnp.float32(0.0)) / jnp.float32(params.temp_range)
+    isch_factor = jnp.exp(-jnp.float32(params.k_isch) * (pn + tn))
+
+    GER        = jnp.float32(params.k_ge) * osmotic_brake * isch_factor
+    fluid_abs  = GER * stom_fluid
+
+    return {
+        "cho_absorption_g_min":  cho_abs,
+        "fluid_absorbed_L_min":  fluid_abs,
+    }

@@ -211,6 +211,10 @@ class HubName:
     # GI absorption
     CHO_ABS_G_MIN         = "hub_cho_absorption_g_min"
     FRU_ABS_G_MIN         = "hub_fru_absorption_g_min"
+    FLUID_ABSORBED_L_MIN  = "fluid_absorbed"
+
+    # Neural/Cognitive
+    NC_CAR                = "nc_car"
 
 
 # ── NM <-> Metabolic glycogen hub functions ───────────────────────────────────
@@ -303,6 +307,8 @@ class HubState(NamedTuple):
     cho_absorption:   GaussianMsg   # [g/min]           GI -> Metabolic
     basal_temp_offset: GaussianMsg  # [°C]              Gonadal/P4 -> ThermoRenal setpoint
     anabolic_drive:   GaussianMsg   # [0-1]             T/E2 -> NM repair, MG insulin sensitivity
+    fluid_absorbed:   GaussianMsg   # [L/min]           GI -> ThermoRenal (absorbed water from intestine)
+    nc_car:           GaussianMsg   # [0-1]             NC -> NM (central activation ratio)
 
 
 def default_hub_state() -> HubState:
@@ -334,6 +340,8 @@ def default_hub_state() -> HubState:
         cho_absorption     = _w(0.0,    0.01),     # 0 g/min (rest)
         basal_temp_offset  = _w(0.0,    0.01),     # 0 +/- 0.1 °C (follicular/male default)
         anabolic_drive     = _w(0.5,    0.04),     # 0.5 +/- 0.2 (moderate default)
+        fluid_absorbed     = _w(0.0,    0.001),    # 0 L/min at rest; GI publishes
+        nc_car             = _w(0.95,   0.0025),   # rested CAR (sigma=0.05); NC publishes
     )
 
 

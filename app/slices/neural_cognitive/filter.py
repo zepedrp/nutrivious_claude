@@ -1,56 +1,44 @@
 """
-app/slices/neural_cognitive/filter.py  — REMASTER v2.0
+app/slices/neural_cognitive/filter.py  -- NC Slice V3.0 (TUKF Gold Standard)
 
-L4 State Filter — Neural/Cognitive Slice
+L4 State Filter -- Neural/Cognitive Slice
 Unscented Kalman Filter for the 7-state neural/cognitive system.
 
-Architecture (HLD §4.3 — L4: State Estimation)
-────────────────────────────────────────────────
-State x ∈ ℝ⁷ (hours):
+Architecture (HLD ss4.3 -- L4: State Estimation)
+--------------------------------------------------
+State x in R^7 (hours):
     [Brain_5HT, Brain_DA, Brain_Ammonia, Cerebral_O2_Sat,
      Adenosine_Pool, Caffeine_Plasma, CAR]
 
-Observations y ∈ ℝ²:
-    [RPE_Proxy [1–10], PVT_Lapses [count/10 min]]
+Observations y in R^2:
+    [RPE_Proxy [1-10], PVT_Lapses [count/10 min]]
 
-Transition f(x, u) — ODE advance over dt_hours (diffrax.Tsit5)
-────────────────────────────────────────────────────────────────
-Time constants (system NOT stiff → Tsit5 appropriate):
-    5HT/DA        t½ ≈ 3.5 h
-    NH3           t½ ≈ 1.4 h
-    Cerebral O2   τ  ≈ 0.5 h (k_o2_relax = 2 h⁻¹)
-    Adenosine     t½ ≈ 7 h
-    Caffeine      t½ ≈ 5 h (population mean CYP1A2)
-    CAR           τ  ≈ 0.5 h (k_car_rec = 2 h⁻¹)
+UKF parametrisation (Merwe & Wan 2000):
+    alpha = 0.5 (float32-safe for n=7; Wm[0] = -3.0, no cancellation)
+    beta  = 2.0, kappa = 0.0
 
-Sparse Assimilation
-───────────────────
-RPE_Proxy:  available only during/after training sessions.
-PVT_Lapses: available only when a morning cognitive test is performed.
-flag = 4 → R_channel × 1e8 (predict-only for that channel).
-
-UKF parametrisation (Merwe & Wan 2000)
-────────────────────────────────────────
-    α = 1e-3, β = 2, κ = 0
-    n = 7 → 2n+1 = 15 sigma points
+TUKF Blindage (Simon 2010):
+    sigma_points : eigh-based (PSD-robust), shared from ukf_filter.py.
+    Post-predict : Q scaled by dt_hours (Wiener scaling).
+    Post-update  : _apply_physical_clamps_nc:
+                     lower_clamp_moments(lb=0) for 5HT, DA, Aden, Caf.
+                     range_clamp_moments([0,1]) for NH3, O2Sat, CAR.
+                     variance_floor + nearest_psd.
+    Fail-Loud    : RuntimeError on NaN posterior_mean or non-PSD diagonal.
 
 Process noise Q (diagonal, calibrated to 1-hour biological variability):
-    Brain_5HT         : (0.10 au)²   — hourly exercise-dependent variation
-    Brain_DA          : (0.10 au)²   — COMT-driven variability
-    Brain_NH3         : (0.03 au)²   — slow AMP deamination dynamics
-    Cerebral_O2_Sat   : (0.02)²      — tightly CBF-regulated
-    Adenosine_Pool    : (0.05 au)²   — slow adenosine dynamics
-    Caffeine_Plasma   : (0.50 mg/L)² — depends on intake variability
-    CAR               : (0.05)²      — fast recovery; well constrained
-
-Fail-Loud contract
-──────────────────
-RuntimeError if posterior_mean contains NaN.
-RuntimeError if posterior_cov diagonal contains negative values.
+    Brain_5HT         : (0.10 au)^2
+    Brain_DA          : (0.10 au)^2
+    Brain_NH3         : (0.03 au)^2
+    Cerebral_O2_Sat   : (0.02)^2
+    Adenosine_Pool    : (0.05 au)^2
+    Caffeine_Plasma   : (0.50 mg/L)^2
+    CAR               : (0.05)^2
 
 References
-──────────
+----------
     Merwe & Wan (2000) Proc ASSPCC
+    Simon D. (2010) Optimal State Estimation, Wiley. Sections 5.3-5.4.
     Nehlig A. (2010) Neurosci Biobehav Rev 35(2):430
     Van Dongen H.P.A. et al. (2003) Sleep 26(2):117
 """
@@ -96,42 +84,60 @@ from app.slices.neural_cognitive.observation import (
     R_NC_DEFAULT,
     inflate_R_nc,
 )
-from app.engine.assimilation.ukf_filter import GaussianState
+from app.engine.assimilation.ukf_filter import (
+    GaussianState,
+    nearest_psd,
+    variance_floor,
+    ukf_weights,
+    sigma_points,
+    unscented_transform,
+    scale_Q,
+    lower_clamp_moments,
+    range_clamp_moments,
+    clamp_dim,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# ── UKF Merwe-Wan σ-point parameters (n = STATE_DIM = 7) ─────────────────────
+# ── UKF Merwe-Wan sigma-point parameters (n = STATE_DIM = 7) ─────────────────
 #
-# alpha = 0.5 (NOT 1e-3): with n=7, alpha=1e-3 gives n+lambda ≈ 7e-6 and
-# weights of ±1e6, causing float32 catastrophic cancellation (WM_0 ≈ -999999,
-# WM_i ≈ 71429; sum OK in exact arithmetic, but not in float32).
-# alpha = 0.5 → n+lambda = 1.75, WM_0 = -3.0, WM_i = 0.286 — no cancellation.
+# alpha = 0.5: float32-safe for n=7.
+# With alpha=1e-3, n=7: Wm[0] ~ -1e6, Wi ~ 71429; catastrophic cancellation in
+# float32. alpha=0.5 gives Wm[0] = -3.0, Wi = 0.286 — no cancellation.
+# See ukf_filter.py module docstring for the full float32 safety analysis.
 
 _ALPHA: float = 0.5
 _BETA:  float = 2.0
 _KAPPA: float = 0.0
-_N:     int   = STATE_DIM                           # 7
+_N:     int   = STATE_DIM  # 7
 
-_LAM:   float = _ALPHA**2 * (_N + _KAPPA) - _N    # = 0.25×7 − 7 = −5.25
-_WM_0:  float = _LAM  / (_N + _LAM)               # = −5.25/1.75 = −3.0
-_WC_0:  float = _WM_0 + (1.0 - _ALPHA**2 + _BETA) # = −3.0 + 2.75 = −0.25
-_WI:    float = 0.5   / (_N + _LAM)               # = 0.5/1.75 ≈ 0.2857
-
-_WM: jax.Array = jnp.array([_WM_0] + [_WI] * (2 * _N), dtype=jnp.float32)
-_WC: jax.Array = jnp.array([_WC_0] + [_WI] * (2 * _N), dtype=jnp.float32)
+_WM, _WC, _LAM = ukf_weights(_N, _ALPHA, _BETA, _KAPPA)
 
 
-# ── Process noise Q (diagonal, Δt = 1 hour) ──────────────────────────────────
+# ── Simon 2010 variance floor (Section 5.4) ───────────────────────────────────
+
+_VAR_FLOOR: jax.Array = jnp.array([
+    1e-6,   # Brain_5HT        (0.001 au)^2
+    1e-6,   # Brain_DA         (0.001 au)^2
+    1e-8,   # Brain_NH3        (0.0001 au)^2
+    1e-8,   # Cerebral_O2_Sat  (0.0001 frac)^2
+    1e-6,   # Adenosine_Pool   (0.001 au)^2
+    1e-4,   # Caffeine_Plasma  (0.01 mg/L)^2
+    1e-8,   # CAR              (0.0001)^2
+], dtype=jnp.float32)
+
+
+# ── Process noise Q (diagonal, per hour) ─────────────────────────────────────
 
 _Q_DIAG: jax.Array = jnp.array([
-    0.0100,   # Brain_5HT        [au]²  = (0.10)²  — exercise variation
-    0.0100,   # Brain_DA         [au]²  = (0.10)²  — COMT-driven variability
-    0.0009,   # Brain_NH3        [au]²  = (0.03)²  — slow AMP deamination
-    0.0004,   # Cerebral_O2_Sat  [.]²   = (0.02)²  — CBF-regulated; tight
-    0.0025,   # Adenosine_Pool   [au]²  = (0.05)²  — slow adenosine dynamics
-    0.2500,   # Caffeine_Plasma  [mg/L]²= (0.50)²  — intake variability
-    0.0025,   # CAR              [.]²   = (0.05)²  — fast recovery; tight
+    0.0100,   # Brain_5HT        [au]^2   = (0.10)^2  -- exercise variation
+    0.0100,   # Brain_DA         [au]^2   = (0.10)^2  -- COMT-driven variability
+    0.0009,   # Brain_NH3        [au]^2   = (0.03)^2  -- slow AMP deamination
+    0.0004,   # Cerebral_O2_Sat  [.]^2    = (0.02)^2  -- CBF-regulated; tight
+    0.0025,   # Adenosine_Pool   [au]^2   = (0.05)^2  -- slow adenosine dynamics
+    0.2500,   # Caffeine_Plasma  [mg/L]^2 = (0.50)^2  -- intake variability
+    0.0025,   # CAR              [.]^2    = (0.05)^2  -- fast recovery; tight
 ], dtype=jnp.float32)
 
 Q_DEFAULT: jax.Array = jnp.diag(_Q_DIAG)
@@ -140,7 +146,6 @@ Q_DEFAULT: jax.Array = jnp.diag(_Q_DIAG)
 # ── Transition parameters ─────────────────────────────────────────────────────
 
 class NeuralCogTransitionParams(NamedTuple):
-    """Full parameter set for the neural/cognitive ODE transition step."""
     nc:       NeuralCognitiveParams = DEFAULT_NC_PARAMS
     dt_hours: float                 = 1.0
 
@@ -156,10 +161,10 @@ def _integrate_step(
     params: NeuralCogTransitionParams,
 ) -> jax.Array:
     """
-    Integrate the 7-state neural/cognitive ODE for params.dt_hours hours.
+    Integrate the 7-state NC ODE for params.dt_hours hours.
 
     vmap-compatible: only x varies across sigma points.
-    dt0 = 0.05 h (fixed; JIT-safe — not derived from params.dt_hours).
+    dt0 = 0.05 h (fixed; JIT-safe -- not derived from params.dt_hours).
     """
     sol = diffrax.diffeqsolve(
         terms     = diffrax.ODETerm(neural_cognitive_ode),
@@ -175,88 +180,145 @@ def _integrate_step(
     return sol.ys[0]
 
 
-# ── Pure-JAX UKF kernels ──────────────────────────────────────────────────────
+# ── Physical clamps (Simon 2010 truncated-normal) ─────────────────────────────
 
-def _sigma_points(mean: jax.Array, cov: jax.Array) -> jax.Array:
-    """Merwe-Wan 2n+1 sigma points. Returns shape (15, 7)."""
-    n = mean.shape[0]
-    L = jnp.linalg.cholesky((_N + _LAM) * cov)
-    pos = mean[None, :] + L.T
-    neg = mean[None, :] - L.T
-    return jnp.concatenate([mean[None, :], pos, neg], axis=0)
-
-
-def _recover_mean_cov(
-    pts:       jax.Array,
-    noise_cov: jax.Array,
-    Wm:        jax.Array,
-    Wc:        jax.Array,
+def _apply_physical_clamps_nc(
+    mean: jax.Array,
+    cov:  jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """Recover (mean, cov) from propagated sigma points + additive noise."""
-    mean = jnp.einsum("i,ij->j", Wm, pts)
-    diff = pts - mean[None, :]
-    cov  = jnp.einsum("i,ij,ik->jk", Wc, diff, diff) + noise_cov
+    """
+    Gaussian-coherent physical clamping for all 7 NC states.
+
+    Step 1 -- truncated-normal moment matching:
+        Brain_5HT       >= 0       (positive concentration)
+        Brain_DA        >= 0       (positive concentration)
+        Brain_NH3       in [0, 1]  (normalised toxicity index)
+        Cerebral_O2_Sat in [0, 1]  (fractional oxygenation)
+        Adenosine_Pool  >= 0       (accumulation pool)
+        Caffeine_Plasma >= 0       (non-negative plasma concentration)
+        CAR             in [0, 1]  (voluntary drive fraction)
+
+    Step 2 -- variance floor (Simon 2010 Section 5.4).
+    Step 3 -- nearest_psd repair (Higham 1988).
+    """
+    m, v = lower_clamp_moments(mean[IDX_5HT], cov[IDX_5HT, IDX_5HT], 0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_5HT, m, v)
+
+    m, v = lower_clamp_moments(mean[IDX_DA], cov[IDX_DA, IDX_DA], 0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_DA, m, v)
+
+    m, v = range_clamp_moments(mean[IDX_NH3], cov[IDX_NH3, IDX_NH3], 0.0, 1.0)
+    mean, cov = clamp_dim(mean, cov, IDX_NH3, m, v)
+
+    m, v = range_clamp_moments(mean[IDX_O2SAT], cov[IDX_O2SAT, IDX_O2SAT], 0.0, 1.0)
+    mean, cov = clamp_dim(mean, cov, IDX_O2SAT, m, v)
+
+    m, v = lower_clamp_moments(mean[IDX_ADEN], cov[IDX_ADEN, IDX_ADEN], 0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_ADEN, m, v)
+
+    m, v = lower_clamp_moments(mean[IDX_CAF], cov[IDX_CAF, IDX_CAF], 0.0)
+    mean, cov = clamp_dim(mean, cov, IDX_CAF, m, v)
+
+    m, v = range_clamp_moments(mean[IDX_CAR], cov[IDX_CAR, IDX_CAR], 0.0, 1.0)
+    mean, cov = clamp_dim(mean, cov, IDX_CAR, m, v)
+
+    cov = variance_floor(cov, _VAR_FLOOR)
+    cov = nearest_psd(cov)
     return mean, cov
 
 
+# ── Pure-JAX UKF kernels ───────────────────────────────────────────────────────
+
 @jax.jit
-def _ukf_predict(
+def _ukf_predict_nc(
     mean:   jax.Array,
     cov:    jax.Array,
     u:      jax.Array,
     params: NeuralCogTransitionParams,
     Q:      jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """UKF predict: unscented transform through 7-state ODE. 15 sigma points."""
-    Q_scaled  = Q * jnp.float32(params.dt_hours)
-    sigma     = _sigma_points(mean, cov)
-    sigma_nxt = jax.vmap(
-        _integrate_step, in_axes=(0, None, None)
-    )(sigma, u, params)
-    return _recover_mean_cov(sigma_nxt, Q_scaled, _WM, _WC)
+    """
+    UKF predict: eigh-based sigma points through the dt_hours NC ODE.
+
+    Q must be pre-scaled to dt_hours (via scale_Q) before calling.
+
+    Parameters
+    ----------
+    mean   : (STATE_DIM,)
+    cov    : (STATE_DIM, STATE_DIM)
+    u      : (CTRL_DIM,)
+    params : NeuralCogTransitionParams
+    Q      : (STATE_DIM, STATE_DIM) -- dt-scaled process noise
+
+    Returns
+    -------
+    (mean_pred, cov_pred)
+    """
+    pts      = sigma_points(mean, cov, _LAM)
+    pts_next = jax.vmap(_integrate_step, in_axes=(0, None, None))(pts, u, params)
+    return unscented_transform(pts_next, Q, _WM, _WC)
 
 
 @jax.jit
-def _ukf_update(
+def _ukf_update_nc(
     mean_pred:  jax.Array,
     cov_pred:   jax.Array,
     y_obs:      jax.Array,
     obs_params: NeuralCogObsParams,
     R:          jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """UKF measurement update ([RPE_Proxy, PVT_Lapses])."""
-    sigma   = _sigma_points(mean_pred, cov_pred)       # (15, 7)
-    y_sigma = h_nc_sigma(sigma, obs_params)             # (15, 2)
+    """
+    UKF measurement update ([RPE_Proxy, PVT_Lapses]).
 
-    y_mean = jnp.einsum("i,ij->j", _WM, y_sigma)       # (2,)
-    dy_s   = y_sigma  - y_mean[None, :]                 # (15, 2)
-    dx_s   = sigma    - mean_pred[None, :]               # (15, 7)
+    Parameters
+    ----------
+    mean_pred  : (STATE_DIM,)
+    cov_pred   : (STATE_DIM, STATE_DIM)
+    y_obs      : (OBS_DIM,) = (2,)
+    obs_params : NeuralCogObsParams
+    R          : (OBS_DIM, OBS_DIM) -- per-channel inflated noise
 
-    S_yy   = jnp.einsum("i,ij,ik->jk", _WC, dy_s, dy_s) + R   # (2,2)
-    P_xy   = jnp.einsum("i,ij,ik->jk", _WC, dx_s, dy_s)        # (7,2)
+    Returns
+    -------
+    (posterior_mean, posterior_cov)
+    """
+    pts    = sigma_points(mean_pred, cov_pred, _LAM)
+    y_pts  = h_nc_sigma(pts, obs_params)
 
-    K              = P_xy @ jnp.linalg.inv(S_yy)
-    innovation     = y_obs - y_mean
-    posterior_mean = mean_pred + K @ innovation
-    posterior_cov  = cov_pred  - K @ S_yy @ K.T
+    y_mean = jnp.einsum("i,ij->j", _WM, y_pts)
+    dy     = y_pts - y_mean[None, :]
+    dx     = pts   - mean_pred[None, :]
 
-    return posterior_mean, posterior_cov
+    S_yy   = jnp.einsum("i,ij,ik->jk", _WC, dy, dy) + R
+    P_xy   = jnp.einsum("i,ij,ik->jk", _WC, dx, dy)
+
+    K          = P_xy @ jnp.linalg.inv(S_yy)
+    innovation = y_obs - y_mean
+    post_mean  = mean_pred + K @ innovation
+    post_cov   = cov_pred  - K @ S_yy @ K.T
+
+    return post_mean, post_cov
 
 
 # ── Public filter class ───────────────────────────────────────────────────────
 
 class NeuralCognitiveStateFilter:
     """
-    L4 Unscented Kalman Filter for the 7-state Neural/Cognitive system.
+    L4 TUKF for the 7-state Neural/Cognitive system.
 
     Sparse assimilation: RPE (post-session) + PVT_Lapses (morning test).
     Most steps are predict-only (quality_flag = 4).
+    Dynamic dt_hours: intra-session (<=1 h) to between-session (<=24 h).
 
-    Dynamic dt_hours: intra-session (≤ 1 h) to between-session (≤ 24 h).
-    Q is scaled by dt_hours per call.
+    TUKF blindage (Simon 2010):
+        sigma_points : eigh-based (robust to float32 non-PSD drift).
+        lower_clamp_moments for: 5HT, DA, Aden, Caf.
+        range_clamp_moments for: NH3 [0,1], O2Sat [0,1], CAR [0,1].
+        variance_floor + nearest_psd after every update.
+        Q scaled by dt_hours (Wiener scaling).
 
     Fail-Loud contract
-    ──────────────────
+    ------------------
     RuntimeError on NaN posterior_mean.
     RuntimeError on non-PSD covariance.
     """
@@ -273,15 +335,13 @@ class NeuralCognitiveStateFilter:
 
         if _DYNAMAX_OK:
             self._dyn_ukf = UnscentedKalmanFilter(STATE_DIM, OBS_DIM)
-            logger.info("NeuralCognitiveStateFilter — dynamax backend registered.")
+            logger.info("NeuralCognitiveStateFilter -- dynamax backend registered.")
         else:
             self._dyn_ukf = None
             logger.warning(
-                "NeuralCognitiveStateFilter — dynamax not installed; "
+                "NeuralCognitiveStateFilter -- dynamax not installed; "
                 "single-step only."
             )
-
-    # ── Primary API: single-step update ──────────────────────────────────────
 
     def update_state(
         self,
@@ -298,20 +358,25 @@ class NeuralCognitiveStateFilter:
 
         Parameters
         ----------
-        prior         : GaussianState(mean ∈ ℝ⁷, cov ∈ ℝ⁷ˣ⁷)
+        prior         : GaussianState(mean in R^7, cov in R^7x7)
         controls      : dict with keys:
-                        'hub_training_stress', 'hub_muscle_damage', 'hub_T_core',
-                        'hub_sleep_debt', 'hub_IL6', 'hub_metabolic_stress',
-                        'caffeine_intake_plasma', 'hub_hypoglycemia'
-        dt_hours      : float — integration window [h]
-        rpe_proxy     : float [1–10]; NaN = unavailable
+                        'hub_training_stress'    [0-1]      aerobic intensity
+                        'hub_muscle_damage'      [0-1]      structural damage
+                        'hub_T_core'             [degC]     core temperature
+                        'hub_sleep_debt'         [au]       sleep deficit
+                        'hub_IL6'                [au]       systemic IL-6
+                        'hub_metabolic_stress'   [0-1]      metabolic acidosis
+                        'caffeine_intake_plasma' [mg/L/h]   caffeine absorption
+                        'hub_hypoglycemia'       [0-1]      glucose deficit
+        dt_hours      : float -- integration window [h]
+        rpe_proxy     : float [1-10]; NaN = unavailable
         pvt_lapses    : float [count/10 min]; NaN = unavailable
         quality_flags : (flag_RPE, flag_PVT); 4 = predict-only
         params        : NeuralCogTransitionParams (defaults to population)
 
         Returns
         -------
-        GaussianState — posterior (mean, cov)
+        GaussianState -- posterior (mean, cov)
 
         Raises
         ------
@@ -323,20 +388,23 @@ class NeuralCognitiveStateFilter:
             params = params._replace(dt_hours=dt_hours)
 
         u = jnp.array([
-            float(controls.get("hub_training_stress",   0.0)),
-            float(controls.get("hub_muscle_damage",     0.0)),
-            float(controls.get("hub_T_core",            37.0)),
-            float(controls.get("hub_sleep_debt",        0.0)),
-            float(controls.get("hub_IL6",               0.0)),
-            float(controls.get("hub_metabolic_stress",  0.0)),
+            float(controls.get("hub_training_stress",    0.0)),
+            float(controls.get("hub_muscle_damage",      0.0)),
+            float(controls.get("hub_T_core",             37.0)),
+            float(controls.get("hub_sleep_debt",         0.0)),
+            float(controls.get("hub_IL6",                0.0)),
+            float(controls.get("hub_metabolic_stress",   0.0)),
             float(controls.get("caffeine_intake_plasma", 0.0)),
-            float(controls.get("hub_hypoglycemia",      0.0)),
+            float(controls.get("hub_hypoglycemia",       0.0)),
         ], dtype=jnp.float32)
 
-        # ── Predict ───────────────────────────────────────────────────────────
-        mean_pred, cov_pred = _ukf_predict(prior.mean, prior.cov, u, params, self.Q)
+        # ── dt-scaled Q (Wiener scaling) ──────────────────────────────────────
+        Q_step = scale_Q(self.Q, dt_hours)
 
-        # ── Inflate R for unavailable channels ───────────────────────────────
+        # ── Predict ───────────────────────────────────────────────────────────
+        mean_pred, cov_pred = _ukf_predict_nc(prior.mean, prior.cov, u, params, Q_step)
+
+        # ── Inflate R for unavailable channels ────────────────────────────────
         obs_vals = [rpe_proxy, pvt_lapses]
         flags    = list(quality_flags)
         for ch_idx, val in enumerate(obs_vals):
@@ -352,52 +420,28 @@ class NeuralCognitiveStateFilter:
         ], dtype=jnp.float32)
 
         # ── Update ────────────────────────────────────────────────────────────
-        posterior_mean, posterior_cov = _ukf_update(
+        post_mean, post_cov = _ukf_update_nc(
             mean_pred, cov_pred, y_obs, self.obs_params, R_step
         )
 
-        # ── Physics-law bounds enforcement ────────────────────────────────────
-        _EPS_CONC = jnp.float32(1e-4)
-        posterior_mean = posterior_mean.at[IDX_5HT].set(
-            jnp.maximum(posterior_mean[IDX_5HT], _EPS_CONC)
-        )
-        posterior_mean = posterior_mean.at[IDX_DA].set(
-            jnp.maximum(posterior_mean[IDX_DA], _EPS_CONC)
-        )
-        posterior_mean = posterior_mean.at[IDX_NH3].set(
-            jnp.clip(posterior_mean[IDX_NH3], jnp.float32(0.0), jnp.float32(1.0))
-        )
-        posterior_mean = posterior_mean.at[IDX_O2SAT].set(
-            jnp.clip(posterior_mean[IDX_O2SAT], jnp.float32(0.0), jnp.float32(1.0))
-        )
-        posterior_mean = posterior_mean.at[IDX_ADEN].set(
-            jnp.maximum(posterior_mean[IDX_ADEN], jnp.float32(0.0))
-        )
-        posterior_mean = posterior_mean.at[IDX_CAF].set(
-            jnp.maximum(posterior_mean[IDX_CAF], jnp.float32(0.0))
-        )
-        posterior_mean = posterior_mean.at[IDX_CAR].set(
-            jnp.clip(posterior_mean[IDX_CAR], jnp.float32(0.0), jnp.float32(1.0))
-        )
+        # ── TUKF physical clamps (Simon 2010): moment matching + floor + PSD ──
+        post_mean, post_cov = _apply_physical_clamps_nc(post_mean, post_cov)
 
-        # ── Fail-Loud checks ──────────────────────────────────────────────────
-        if bool(jnp.any(jnp.isnan(posterior_mean))):
+        # ── Fail-Loud: divergence detection ───────────────────────────────────
+        if bool(jnp.any(jnp.isnan(post_mean))):
             raise RuntimeError(
                 "NeuralCognitiveStateFilter.update_state: posterior_mean contains NaN. "
                 f"rpe_proxy={rpe_proxy}, pvt_lapses={pvt_lapses}, "
                 f"quality_flags={quality_flags}, dt_hours={dt_hours}."
             )
-        diag = jnp.diag(posterior_cov)
+        diag = jnp.diag(post_cov)
         if bool(jnp.any(diag < jnp.float32(-1e-6))):
             raise RuntimeError(
                 "NeuralCognitiveStateFilter.update_state: posterior_cov has negative "
-                "diagonal — filter diverged. Increase Q or R."
+                "diagonal -- filter diverged. Increase Q or R."
             )
 
-        posterior_cov = jnp.float32(0.5) * (posterior_cov + posterior_cov.T)
-        return GaussianState(mean=posterior_mean, cov=posterior_cov)
-
-    # ── Batch filtering (dynamax backend) ─────────────────────────────────────
+        return GaussianState(mean=post_mean, cov=post_cov)
 
     def build_dynamax_params(
         self,

@@ -53,6 +53,8 @@ import pytest
 from app.engine.orchestrator import (
     PentaOrchestrator,
     PentaState,
+    HeptaOrchestrator,
+    HeptaState,
     TrioOrchestrator,
     TrioState,
 )
@@ -244,6 +246,192 @@ def test_trio_legacy_compat():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Hepta fixtures
+# ─────────────────────────────────────────────────────────────────────────────
+
+HEPTA_CONTROLS_REST = {
+    "power_W":                    0.0,
+    "hub_circadian_phase":        0.0,
+    "hub_sleep_sws":              0.0,
+    "hub_fluid_intake_L_min":     0.008,
+    "hub_sodium_intake_mmol_min": 0.4,
+    "hub_sodium_mmolL":           140.0,
+    "t_hour":                     10.0,
+    # GI
+    "gi_glu_in_g_min":            0.0,
+    "gi_fru_in_g_min":            0.0,
+    # NC
+    "hub_sleep_debt":             0.0,
+    "hub_metabolic_stress":       0.0,
+    "caffeine_intake_plasma":     0.0,
+}
+
+HEPTA_CONTROLS_EXERCISE = {
+    "power_W":                    250.0,
+    "hub_circadian_phase":        0.0,
+    "hub_sleep_sws":              0.0,
+    "hub_fluid_intake_L_min":     0.014,
+    "hub_sodium_intake_mmol_min": 0.7,
+    "hub_sodium_mmolL":           140.0,
+    "t_hour":                     10.0,
+    # GI: moderate carbohydrate intake
+    "gi_glu_in_g_min":            0.6,
+    "gi_fru_in_g_min":            0.3,
+    # NC: mild exercise stress
+    "hub_sleep_debt":             0.0,
+    "hub_metabolic_stress":       0.3,
+    "caffeine_intake_plasma":     0.0,
+}
+
+
+def _hepta_state_is_nan_free(state: HeptaState) -> bool:
+    """Return True iff no NaN in any of the seven slice posterior means."""
+    return (
+        not bool(jnp.any(jnp.isnan(state.nm.mean)))
+        and not bool(jnp.any(jnp.isnan(state.mg.mean)))
+        and not bool(jnp.any(jnp.isnan(state.neuro.mean)))
+        and not bool(jnp.any(jnp.isnan(state.thermo_renal.mean)))
+        and not bool(jnp.any(jnp.isnan(state.cardio.mean)))
+        and not bool(jnp.any(jnp.isnan(state.gastro.mean)))
+        and not bool(jnp.any(jnp.isnan(state.neural_cog.mean)))
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T6 — HeptaOrchestrator default state: NaN-free across all 7 slices + new hub
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_hepta_default_state_no_nan():
+    """Cold-start HeptaState must be fully finite including GI, NC, and new hub fields."""
+    state = HeptaOrchestrator.default_state()
+
+    assert not bool(jnp.any(jnp.isnan(state.nm.mean))),           "NaN in NM default mean"
+    assert not bool(jnp.any(jnp.isnan(state.mg.mean))),           "NaN in MG default mean"
+    assert not bool(jnp.any(jnp.isnan(state.neuro.mean))),        "NaN in Neuro default mean"
+    assert not bool(jnp.any(jnp.isnan(state.thermo_renal.mean))), "NaN in TR default mean"
+    assert not bool(jnp.any(jnp.isnan(state.cardio.mean))),       "NaN in Cardio default mean"
+    assert not bool(jnp.any(jnp.isnan(state.gastro.mean))),       "NaN in GI default mean"
+    assert not bool(jnp.any(jnp.isnan(state.neural_cog.mean))),   "NaN in NC default mean"
+
+    hub = state.hub
+    for field in ["plasma_glucose", "cortisol", "epinephrine", "core_temp",
+                  "pv_drop_pct", "autonomic_tone", "cho_absorption",
+                  "fluid_absorbed", "nc_car"]:
+        val = float(msg_to_mean(getattr(hub, field)))
+        assert math.isfinite(val), f"Non-finite hub.{field} in default state: {val}"
+
+    print("\n[T6] HeptaOrchestrator default state: NaN-free, all 9 hubs finite. PASS.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T7 — Single rest step: all 7 posteriors NaN-free
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_hepta_step_rest_no_nan():
+    """One rest step — all seven posteriors NaN-free, hub fields finite and in range."""
+    orch  = HeptaOrchestrator()
+    state = HeptaOrchestrator.default_state()
+
+    state = orch.step(prior=state, controls=HEPTA_CONTROLS_REST)
+
+    assert _hepta_state_is_nan_free(state), "NaN in HeptaState after rest step"
+
+    hub = state.hub
+    cort     = float(msg_to_mean(hub.cortisol))
+    t_c      = float(msg_to_mean(hub.core_temp))
+    cho_abs  = float(msg_to_mean(hub.cho_absorption))
+    fl_abs   = float(msg_to_mean(hub.fluid_absorbed))
+    nc_car   = float(msg_to_mean(hub.nc_car))
+
+    print(f"\n[T7] REST: T_core={t_c:.3f}°C, cortisol={cort:.1f}, "
+          f"cho_abs={cho_abs:.4f} g/min, fl_abs={fl_abs:.5f} L/min, "
+          f"nc_car={nc_car:.4f}")
+
+    assert 35.0 <= t_c     <= 42.0,   f"T_core out of range: {t_c:.3f}"
+    assert 0.0  <= cho_abs,           f"cho_absorption negative: {cho_abs:.4f}"
+    assert 0.0  <= fl_abs,            f"fluid_absorbed negative: {fl_abs:.5f}"
+    assert 0.0  <= nc_car  <= 1.0,    f"nc_car out of [0,1]: {nc_car:.4f}"
+
+    print("[T7] PASS.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T8 — Single exercise step: GI + NC hub updates finite
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_hepta_step_exercise_updates_hub():
+    """One step at 250W with CHO intake — GI absorption and NC CAR hub updates are finite."""
+    orch  = HeptaOrchestrator()
+    state = HeptaOrchestrator.default_state()
+
+    state = orch.step(prior=state, controls=HEPTA_CONTROLS_EXERCISE)
+
+    assert _hepta_state_is_nan_free(state), "NaN in HeptaState after exercise step"
+
+    hub = state.hub
+    cho_abs  = float(msg_to_mean(hub.cho_absorption))
+    fl_abs   = float(msg_to_mean(hub.fluid_absorbed))
+    nc_car   = float(msg_to_mean(hub.nc_car))
+    t_c      = float(msg_to_mean(hub.core_temp))
+    pv_d     = float(msg_to_mean(hub.pv_drop_pct))
+    atone    = float(msg_to_mean(hub.autonomic_tone))
+
+    print(f"\n[T8] 250W: T_core={t_c:.3f}°C, pv_drop={pv_d:.3f}%, autonomic={atone:.4f}, "
+          f"cho_abs={cho_abs:.4f} g/min, fl_abs={fl_abs:.5f} L/min, nc_car={nc_car:.4f}")
+
+    assert math.isfinite(cho_abs),    "cho_absorption non-finite after exercise"
+    assert math.isfinite(fl_abs),     "fluid_absorbed non-finite after exercise"
+    assert 0.0 <= nc_car <= 1.0,      f"nc_car out of [0,1]: {nc_car:.4f}"
+    assert 35.0 <= t_c   <= 42.0,     f"T_core out of physical range: {t_c:.3f}"
+    assert 0.0  <= pv_d  <= 50.0,     f"pv_drop_pct out of range: {pv_d:.3f}"
+    assert 0.0  <= atone <= 1.0,      f"autonomic_tone out of range: {atone:.4f}"
+
+    print("[T8] PASS.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T9 — 10 consecutive steps at 200W: no NaN accumulation across all 7 slices
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_hepta_10_steps_no_nan():
+    """10 steps at 200W — parallel co-simulation (7 organs) must not accumulate NaN."""
+    orch  = HeptaOrchestrator()
+    state = HeptaOrchestrator.default_state()
+
+    controls_200 = dict(HEPTA_CONTROLS_REST)
+    controls_200["power_W"] = 200.0
+
+    for step in range(10):
+        controls_200["t_hour"] = 10.0 + step / 60.0
+        state = orch.step(prior=state, controls=controls_200)
+
+        assert _hepta_state_is_nan_free(state), (
+            f"NaN in HeptaState at step {step+1}"
+        )
+
+        for name, gs in [
+            ("nm",           state.nm),
+            ("mg",           state.mg),
+            ("neuro",        state.neuro),
+            ("thermo_renal", state.thermo_renal),
+            ("cardio",       state.cardio),
+            ("gastro",       state.gastro),
+            ("neural_cog",   state.neural_cog),
+        ]:
+            diag = jnp.diag(gs.cov)
+            assert bool(jnp.all(diag > 0.0)), (
+                f"Non-positive covariance in {name} at step {step+1}: diag={diag}"
+            )
+
+    hub = state.hub
+    t_c     = float(msg_to_mean(hub.core_temp))
+    cho_abs = float(msg_to_mean(hub.cho_absorption))
+    nc_car  = float(msg_to_mean(hub.nc_car))
+    print(f"\n[T9] 10 steps 200W: T_core={t_c:.3f}°C, "
+          f"cho_abs={cho_abs:.4f} g/min, nc_car={nc_car:.4f} — no NaN. PASS.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -269,4 +457,20 @@ if __name__ == "__main__":
     test_trio_legacy_compat()
     print()
     print("=" * 70)
-    print("ALL 5 PENTA-ORCHESTRATOR TESTS PASSED")
+    print("T6: HeptaOrchestrator default state NaN-free")
+    test_hepta_default_state_no_nan()
+    print()
+    print("=" * 70)
+    print("T7: Single rest step — 7 slices NaN-free")
+    test_hepta_step_rest_no_nan()
+    print()
+    print("=" * 70)
+    print("T8: Single exercise step — GI + NC hub updates finite")
+    test_hepta_step_exercise_updates_hub()
+    print()
+    print("=" * 70)
+    print("T9: 10 consecutive steps — no NaN accumulation (7 organs)")
+    test_hepta_10_steps_no_nan()
+    print()
+    print("=" * 70)
+    print("ALL 9 ORCHESTRATOR TESTS PASSED")

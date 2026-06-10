@@ -45,7 +45,9 @@ def _run_ode(
 ) -> jax.Array:
     """Integrate TR V2 ODE for t1_minutes under constant control u. Returns terminal x."""
     x0_ = X0_TR_DEFAULT if x0 is None else x0
-    u_  = jnp.array(u, dtype=jnp.float32)
+    # Pad to CTRL_DIM=4 (u[3] = hub_basal_temp_offset, default 0.0)
+    u_padded = list(u) + [0.0] * (4 - len(u))
+    u_  = jnp.array(u_padded, dtype=jnp.float32)
     sol = diffrax.diffeqsolve(
         terms     = diffrax.ODETerm(thermo_renal_ode),
         solver    = diffrax.Tsit5(),

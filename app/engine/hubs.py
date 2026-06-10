@@ -301,6 +301,8 @@ class HubState(NamedTuple):
     energy_avail:     GaussianMsg   # [kcal/kgFFM/day]  REDS -> Gonadal, Neuroendocrine
     il6:              GaussianMsg   # [pg/mL]           Immune -> Hemato, Neuroendocrine
     cho_absorption:   GaussianMsg   # [g/min]           GI -> Metabolic
+    basal_temp_offset: GaussianMsg  # [°C]              Gonadal/P4 -> ThermoRenal setpoint
+    anabolic_drive:   GaussianMsg   # [0-1]             T/E2 -> NM repair, MG insulin sensitivity
 
 
 def default_hub_state() -> HubState:
@@ -327,9 +329,11 @@ def default_hub_state() -> HubState:
         w_prime_bal_kJ  = _w(18.0,   16.0),     # 18 +/- 4 kJ (full)
         core_temp       = _w(37.0,   0.25),     # 37 +/- 0.5 deg C
         pv_drop_pct     = _w(0.0,    4.0),      # 0 +/- 2 %
-        energy_avail    = _w(45.0,   100.0),    # 45 +/- 10 kcal/kgFFM
-        il6             = _w(1.0,    1.0),      # 1 +/- 1 pg/mL
-        cho_absorption  = _w(0.0,    0.01),     # 0 g/min (rest)
+        energy_avail       = _w(45.0,   100.0),    # 45 +/- 10 kcal/kgFFM
+        il6                = _w(1.0,    1.0),      # 1 +/- 1 pg/mL
+        cho_absorption     = _w(0.0,    0.01),     # 0 g/min (rest)
+        basal_temp_offset  = _w(0.0,    0.01),     # 0 +/- 0.1 °C (follicular/male default)
+        anabolic_drive     = _w(0.5,    0.04),     # 0.5 +/- 0.2 (moderate default)
     )
 
 

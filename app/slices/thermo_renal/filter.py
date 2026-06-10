@@ -311,9 +311,10 @@ class ThermoRenalStateFilter:
             params = params._replace(dt_minutes=float(dt_minutes))
 
         u = jnp.array([
-            float(controls.get("hub_power_watts",           0.0)),
-            float(controls.get("hub_fluid_intake_L_min",    0.0)),
+            float(controls.get("hub_power_watts",            0.0)),
+            float(controls.get("hub_fluid_intake_L_min",     0.0)),
             float(controls.get("hub_sodium_intake_mmol_min", 0.0)),
+            float(controls.get("hub_basal_temp_offset",      0.0)),
         ], dtype=jnp.float32)
 
         # Predict

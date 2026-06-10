@@ -131,6 +131,15 @@ from app.slices.thermo_renal.ode import (
     IDX_PLASMA_VOL as TR_IDX_PLASMA_VOL,
     DEFAULT_TR_PARAMS,
 )
+from app.slices.gonadal_axis.filter import (
+    GonadalStateFilter,
+    FemaleGonadalTransition,
+    MaleGonadalTransition,
+    DEFAULT_FEMALE_TRANSITION,
+    DEFAULT_MALE_TRANSITION,
+)
+from app.slices.gonadal_axis.female_ode import X0_FEMALE_DEFAULT, P0_FEMALE_DEFAULT
+from app.slices.gonadal_axis.male_ode import X0_MALE_DEFAULT, P0_MALE_DEFAULT
 
 # Reference plasma volume for pv_drop_pct computation
 _TR_PV_REF: float = DEFAULT_TR_PARAMS.PV_ref   # 4.2 L
@@ -291,14 +300,16 @@ class PentaOrchestrator:
         # Read all required hub_t values with NaN guards (physiological defaults).
         # These guard against uninitialised fields and impulsive-input spikes that
         # have not yet propagated through the hub.
-        glc_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.plasma_glucose),  nan=90.0))
-        lac_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.plasma_lactate),  nan=1.0))
-        gly_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.local_gly_norm),  nan=1.0))
-        epi_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.epinephrine),     nan=50.0))
-        cort_t   = float(jnp.nan_to_num(msg_to_mean(hub_t.cortisol),        nan=300.0))
-        tcore_t  = float(jnp.nan_to_num(msg_to_mean(hub_t.core_temp),       nan=37.0))
-        pvdrop_t = float(jnp.nan_to_num(msg_to_mean(hub_t.pv_drop_pct),     nan=0.0))
-        il6_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.il6),             nan=1.0))
+        glc_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.plasma_glucose),    nan=90.0))
+        lac_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.plasma_lactate),    nan=1.0))
+        gly_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.local_gly_norm),    nan=1.0))
+        epi_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.epinephrine),       nan=50.0))
+        cort_t   = float(jnp.nan_to_num(msg_to_mean(hub_t.cortisol),          nan=300.0))
+        tcore_t  = float(jnp.nan_to_num(msg_to_mean(hub_t.core_temp),         nan=37.0))
+        pvdrop_t = float(jnp.nan_to_num(msg_to_mean(hub_t.pv_drop_pct),       nan=0.0))
+        il6_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.il6),               nan=1.0))
+        # Slow-axis boundary condition from SlowAxisOrchestrator (0.0 at cold-start)
+        bto_t    = float(jnp.nan_to_num(msg_to_mean(hub_t.basal_temp_offset),  nan=0.0))
 
         # ── (B) PARALLEL BLOCK: all five organs read hub_t, none reads ────────
         #        another organ's same-step output
@@ -367,7 +378,7 @@ class PentaOrchestrator:
         )
         neuro_state = GaussianState(mean=neuro_result.mean, cov=neuro_result.cov)
 
-        # TR: reads only external controls (power, fluid, sodium) -- no hub coupling
+        # TR: reads power/fluid/sodium from controls + slow-axis basal_temp_offset
         tr_state = self.tr_filt.update_state(
             prior         = prior.thermo_renal,
             core_temp_obs = float(obs_thermo.get("core_temp_obs", math.nan)),
@@ -376,6 +387,7 @@ class PentaOrchestrator:
                 "hub_power_watts":            power_W,
                 "hub_fluid_intake_L_min":     hub_fluid,
                 "hub_sodium_intake_mmol_min": hub_na_in,
+                "hub_basal_temp_offset":      bto_t,   # P4 slow-axis boundary condition
             },
             dt_minutes    = dt_real,
             quality_flags = obs_thermo.get("quality_flags", (4, 4)),
@@ -450,6 +462,149 @@ class PentaOrchestrator:
             cardio       = cardio_state,
             hub          = hub_t1,
         )
+
+
+# ── Slow Axis ─────────────────────────────────────────────────────────────────
+
+class SlowAxisState(NamedTuple):
+    """
+    Immutable snapshot of the slow-axis (day-scale) state.
+
+    Fields
+    ------
+    gonadal : GaussianState — Gonadal HPG axis (female: 7-state; male: 5-state)
+    hub     : HubState      — Full hub snapshot with slow-axis fields updated:
+                              testosterone, basal_temp_offset, anabolic_drive
+    """
+    gonadal: GaussianState
+    hub:     HubState
+
+
+class SlowAxisOrchestrator:
+    """
+    Day-scale orchestrator for the Gonadal HPG axis.
+
+    Runs ONCE per 24 hours (typically at the 03:00 SWS checkpoint after the
+    PentaOrchestrator has completed 1440 minute-steps). Reads the
+    session-end HubState from the fast axis and injects updated boundary
+    conditions (testosterone, basal_temp_offset, anabolic_drive) into the hub
+    for the next 24-hour fast-axis cycle.
+
+    Multi-rate coupling protocol
+    ----------------------------
+    The PentaOrchestrator treats hub.basal_temp_offset and hub.anabolic_drive
+    as slowly-varying "frozen" boundary conditions — they change only once per
+    day. Between SlowAxis updates, the fast axis reads the same frozen values
+    (stale-by-up-to-24h). At dt_day=1 the error on a 2-hour hormonal time
+    constant is < 8%; on the 28-day menstrual cycle it is negligible.
+
+    Typical usage
+    -------------
+    slow = SlowAxisOrchestrator(is_female=True)
+    slow_state = SlowAxisOrchestrator.default_state(is_female=True, hub=fast_hub)
+
+    # At end of each 24-hour block:
+    slow_state = slow.step(prior=slow_state, observations={})
+
+    # Feed updated hub to the next PentaOrchestrator cycle:
+    penta_state = PentaState(*penta_state[:-1], hub=slow_state.hub)
+
+    Fail-Loud contract
+    ------------------
+    Any GonadalStateFilter NaN -> RuntimeError propagated unmodified.
+    """
+
+    def __init__(
+        self,
+        is_female:     bool,
+        gonadal_filter: GonadalStateFilter | None = None,
+    ) -> None:
+        self.is_female    = is_female
+        self.gonadal_filt = gonadal_filter or GonadalStateFilter(is_female=is_female)
+
+    @staticmethod
+    def default_state(
+        is_female: bool,
+        hub:       HubState | None = None,
+    ) -> SlowAxisState:
+        """Population-prior cold-start slow-axis state."""
+        x0 = X0_FEMALE_DEFAULT if is_female else X0_MALE_DEFAULT
+        p0 = P0_FEMALE_DEFAULT if is_female else P0_MALE_DEFAULT
+        return SlowAxisState(
+            gonadal = GaussianState(mean=x0, cov=p0),
+            hub     = hub if hub is not None else default_hub_state(),
+        )
+
+    def step(
+        self,
+        prior:        SlowAxisState,
+        observations: dict[str, float] | None = None,
+        dt_days:      float = 1.0,
+    ) -> SlowAxisState:
+        """
+        Advance the gonadal axis by dt_days (default 1 day) and publish
+        updated boundary conditions to the hub.
+
+        Parameters
+        ----------
+        prior        : SlowAxisState from the previous day
+        observations : optional daily biomarkers:
+            "E2_obs_pg_mL"      float — serum E2 (female)
+            "P4_obs_ng_mL"      float — serum P4 (female)
+            "BBT_obs_C"         float — basal body temperature
+            "Total_T_obs_ng_dL" float — serum T (male)
+            Missing keys → NaN → R×1e8 inflation (predict-only).
+        dt_days      : integration window [days]; default 1.0
+
+        Returns
+        -------
+        SlowAxisState with updated gonadal state and hub:
+            hub.testosterone      — updated from Gonadal posterior
+            hub.basal_temp_offset — updated P4-driven setpoint shift
+            hub.anabolic_drive    — updated T/E2 anabolic index
+
+        Raises
+        ------
+        RuntimeError if GonadalStateFilter posterior contains NaN.
+        """
+        if observations is None:
+            observations = {}
+
+        hub_t = prior.hub
+
+        # Read RED-S energy availability from fast-axis hub
+        ea = float(jnp.nan_to_num(msg_to_mean(hub_t.energy_avail), nan=45.0))
+
+        # Build sex-appropriate transition with EA from hub
+        if self.is_female:
+            transition = DEFAULT_FEMALE_TRANSITION._replace(
+                dt_days=float(dt_days),
+                hub_EA_Pool=ea,
+            )
+        else:
+            transition = DEFAULT_MALE_TRANSITION._replace(
+                dt_days=float(dt_days),
+                hub_EA_Pool=ea,
+            )
+
+        # Advance Gonadal UKF by 1 day
+        gonadal_state = self.gonadal_filt.update_state(
+            prior        = prior.gonadal,
+            observations = observations,
+            transition   = transition,
+        )
+
+        # Compute slow-axis hub publications (GaussianMsg for each field)
+        pubs = self.gonadal_filt.compute_slow_hub_publications(gonadal_state)
+
+        # Inject boundary conditions into hub (single _replace call)
+        hub_t1 = hub_t._replace(
+            testosterone      = pubs["testosterone"],
+            basal_temp_offset = pubs["basal_temp_offset"],
+            anabolic_drive    = pubs["anabolic_drive"],
+        )
+
+        return SlowAxisState(gonadal=gonadal_state, hub=hub_t1)
 
 
 # ── Legacy alias ──────────────────────────────────────────────────────────────

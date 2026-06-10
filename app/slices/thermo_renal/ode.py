@@ -8,10 +8,11 @@ STATE VECTOR  x ∈ ℝ⁵   (time unit: MINUTES)
   x[3]  Inters_Volume_L  Interstitial volume       [L]
   x[4]  Plasma_Sodium_mmol  Total Na in plasma     [mmol]
 
-CONTROL INPUTS  u ∈ ℝ³  (hub variables)
+CONTROL INPUTS  u ∈ ℝ⁴  (hub variables)
   u[0]  hub_power_watts          Metabolic power          [W]
   u[1]  hub_fluid_intake_L_min   Fluid intake rate        [L/min]
   u[2]  hub_sodium_intake_mmol_min  Sodium intake rate    [mmol/min]
+  u[3]  hub_basal_temp_offset    P4-driven setpoint shift [°C] (SlowAxis hub)
 
 PHYSICS
   Thermoreg : 80% of hub_power_watts → heat; linear drive on Core_Temp_C.
@@ -46,11 +47,12 @@ STATE_DIM: int = 5
 OBS_DIM:   int = 2   # [Core_Temp_obs °C, Body_Mass_Drop_kg]
 
 # ── Control indices ───────────────────────────────────────────────────────────
-UIDX_POWER_W = 0
-UIDX_FLUID_L = 1
-UIDX_NA_MMOL = 2
+UIDX_POWER_W     = 0
+UIDX_FLUID_L     = 1
+UIDX_NA_MMOL     = 2
+UIDX_BASAL_TEMP  = 3   # hub_basal_temp_offset [°C] from SlowAxisOrchestrator
 
-CTRL_DIM:  int = 3
+CTRL_DIM:  int = 4
 TIME_UNIT: str = "minutes"
 
 
@@ -135,9 +137,13 @@ def thermo_renal_ode(
     params, u = args
 
     # ── NaN guards on hub inputs ──────────────────────────────────────────────
-    power_W = jnp.where(jnp.isnan(u[UIDX_POWER_W]), jnp.float32(0.0), u[UIDX_POWER_W])
-    fluid   = jnp.where(jnp.isnan(u[UIDX_FLUID_L]), jnp.float32(0.0), u[UIDX_FLUID_L])
-    na_in   = jnp.where(jnp.isnan(u[UIDX_NA_MMOL]), jnp.float32(0.0), u[UIDX_NA_MMOL])
+    power_W  = jnp.where(jnp.isnan(u[UIDX_POWER_W]),    jnp.float32(0.0), u[UIDX_POWER_W])
+    fluid    = jnp.where(jnp.isnan(u[UIDX_FLUID_L]),    jnp.float32(0.0), u[UIDX_FLUID_L])
+    na_in    = jnp.where(jnp.isnan(u[UIDX_NA_MMOL]),    jnp.float32(0.0), u[UIDX_NA_MMOL])
+    # Progesterone-driven setpoint shift from SlowAxis hub (Baker & Jeukendrup 2001).
+    # Follicular/male default = 0.0 °C; mid-luteal peak P4 ≈ +0.35 °C.
+    bto      = jnp.where(jnp.isnan(u[UIDX_BASAL_TEMP]), jnp.float32(0.0), u[UIDX_BASAL_TEMP])
+    bto      = jnp.clip(bto, jnp.float32(-0.1), jnp.float32(0.5))
 
     # ── NaN guards on states ──────────────────────────────────────────────────
     T_core = jnp.where(jnp.isnan(x[IDX_CORE_TEMP]),  jnp.float32(37.0),             x[IDX_CORE_TEMP])
@@ -160,8 +166,10 @@ def thermo_renal_ode(
     # Skin-to-environment convection+radiation [W]
     Q_env = jnp.float32(params.h_skin_env)  * (T_skin - jnp.float32(params.T_ambient))
 
-    # Sweat rate: exponential above 37°C [L/min]
-    excess = jnp.maximum(T_core - jnp.float32(37.0), jnp.float32(0.0))
+    # Sweat rate: exponential above setpoint [L/min].
+    # Setpoint shifts by hub_basal_temp_offset (progesterone; Baker & Jeukendrup 2001).
+    T_sweat_setpoint = jnp.float32(37.0) + bto
+    excess = jnp.maximum(T_core - T_sweat_setpoint, jnp.float32(0.0))
     sweat  = jnp.float32(params.sweat_sensitivity) * (jnp.exp(excess) - jnp.float32(1.0))
 
     # Evaporative cooling of skin [W]  =  sweat[L/min] × L_evap[Wh/L] × 60[min/h]

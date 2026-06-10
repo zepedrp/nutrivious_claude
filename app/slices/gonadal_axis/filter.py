@@ -71,6 +71,7 @@ from app.slices.gonadal_axis.observation import (
     obs_dict_to_array_gonadal,
 )
 from app.engine.assimilation.ukf_filter import GaussianState
+from app.engine.hubs import GaussianMsg, msg_from_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -356,6 +357,75 @@ class GonadalStateFilter:
 
         post_cov = 0.5 * (post_cov + post_cov.T)
         return GaussianState(mean=post_mean, cov=post_cov)
+
+    # ── Slow-axis hub publications (GaussianMsg — for SlowAxisOrchestrator) ─
+
+    def compute_slow_hub_publications(
+        self,
+        state: GaussianState,
+    ) -> dict[str, GaussianMsg]:
+        """
+        Compute GaussianMsg publications for the slow-axis hub boundary conditions.
+
+        Published fields (HubState keys)
+        ---------------------------------
+        testosterone      [ng/dL] — anabolic drive source
+        basal_temp_offset [°C]    — progesterone-driven TR setpoint elevation
+        anabolic_drive    [0-1]   — normalised T/E2 anabolic index
+
+        Physics
+        -------
+        basal_temp_offset:
+            Linear proxy validated by Baker & Jeukendrup (2001) J Physiol and
+            Forsyth et al. (2007): P4 at mid-luteal peak (~15 ng/mL) elevates
+            basal body temperature by ~0.3–0.4°C.
+            offset = clamp(0.4 × P4 / 15, 0, 0.5)  [°C]
+            Uncertainty propagation: sigma2_offset = (0.4/15)^2 * sigma2_P4
+
+        anabolic_drive:
+            Female: E2-driven anabolism modulated by P4 (De Crée 1998).
+                    drive = clamp(E2/200 × (1 – 0.2 × P4/15), 0, 1)
+            Male:   Testosterone-driven anabolism (Bhasin 2001).
+                    drive = clamp(T/700, 0, 1)
+        """
+        x   = state.mean
+        cov = state.cov
+
+        _P4_LUTEAL_PEAK = 15.0   # ng/mL — mid-luteal reference (Baker 2001)
+
+        if self.is_female:
+            p4      = float(x[IDX_F_P4])
+            p4_var  = float(cov[IDX_F_P4, IDX_F_P4])
+            e2      = float(x[IDX_F_E2])
+            e2_var  = float(cov[IDX_F_E2, IDX_F_E2])
+            t_val   = _T_FEMALE_ADRENAL_ng_dL
+            t_var   = 25.0   # adrenal baseline T nearly constant in females
+
+            # anabolic_drive: E2-driven with mild P4 inhibition (De Crée 1998)
+            p4_norm = min(p4 / _P4_LUTEAL_PEAK, 1.0)
+            ad_mean = float(max(0.0, min(1.0, (e2 / 200.0) * (1.0 - 0.2 * p4_norm))))
+            ad_var  = e2_var / (200.0 ** 2) + 1e-6
+        else:
+            E2_arr, _ = male_algebraic_outputs(x, DEFAULT_MALE_PARAMS)
+            p4        = float(P4_ADRENAL_BASAL_MALE)
+            p4_var    = 1e-4   # male adrenal P4 nearly constant
+            e2_var    = float(cov[IDX_M_T, IDX_M_T]) * (DEFAULT_MALE_PARAMS.k_aromatase ** 2)
+            t_val     = float(x[IDX_M_T])
+            t_var     = float(cov[IDX_M_T, IDX_M_T])
+
+            # anabolic_drive: T-normalised by population-mean eugonadal T (Bhasin 2001)
+            ad_mean = float(max(0.0, min(1.0, t_val / 700.0)))
+            ad_var  = t_var / (700.0 ** 2) + 1e-6
+
+        # basal_temp_offset [°C]: progesterone-driven setpoint elevation
+        bto_mean = float(max(0.0, min(0.5, 0.4 * p4 / _P4_LUTEAL_PEAK)))
+        bto_var  = (0.4 / _P4_LUTEAL_PEAK) ** 2 * p4_var + 1e-6
+
+        return {
+            "testosterone":      msg_from_scalar(t_val,    t_var    + 1e-8),
+            "basal_temp_offset": msg_from_scalar(bto_mean, bto_var  + 1e-8),
+            "anabolic_drive":    msg_from_scalar(ad_mean,  ad_var   + 1e-8),
+        }
 
     # ── Hub variable export (identical keys for both sexes) ───────────────
 

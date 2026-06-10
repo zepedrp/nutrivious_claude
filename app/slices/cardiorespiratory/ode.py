@@ -149,11 +149,12 @@ class CardioSliceParams(NamedTuple):
     HR_floor: float   # bpm
 
     # ── Circadian modulator (Borbely 1982 two-process model) ─────────────
-    # AT equilibrium shifts to (1.0 + circ_amp) during Phase 2 sleep.
-    # Set to 0.0 for all daytime operation; injected by _blind_overnight_predict.
-    # Propagated correctly through UKF sigma points inside the ODE -- no external
-    # mean-hacks needed.
-    circ_amp: float = 0.0   # adim; AT_target = 1.0 + circ_amp
+    # AT recovery ceiling = chronic_fraction + circ_amp, where:
+    #   chronic_fraction = RMSSD_load_7d / RMSSD_ref_ms  (chronic memory anchor)
+    #   circ_amp         = 0.0 daytime; 0.13 at wake_hour=08:00 (Phase 2 sleep)
+    # Injected by _blind_overnight_predict; 0.0 for all daytime operation.
+    # Propagated through UKF sigma points -- no external mean-hacks needed.
+    circ_amp: float = 0.0   # adim; AT_target = chronic_fraction + circ_amp
 
 
 # ── Population-mean default parameters ───────────────────────────────────────
@@ -375,16 +376,23 @@ def cardiorespiratory_slice_ode(
     # ══════════════════════════════════════════════════════════════════════
     # VI. AUTONOMIC TONE -- HRV proxy (Arai 1989 + Kontro 2026)
     #
+    # AT_target is anchored to chronic fitness memory via RMSSD_load_7d:
+    #   chronic_fraction = RMSSD_load_7d / RMSSD_ref_ms
+    #   AT_target        = chronic_fraction + circ_amp
+    #
+    # After heavy training weeks RMSSD_load_7d < RMSSD_ref_ms, so the AT
+    # recovery ceiling is suppressed -- the ODE carries chronic fatigue
+    # memory rather than naively recovering to 1.0 every night.
     # Depletion signal uses TOTAL W' (fast + slow pools combined).
     # ══════════════════════════════════════════════════════════════════════
-    W_total_real = W_fast + W_slow
-    w_depletion  = jnp.maximum(
+    W_total_real     = W_fast + W_slow
+    w_depletion      = jnp.maximum(
         jnp.float32(0.0),
         jnp.float32(1.0) - W_total_real / jnp.maximum(W_cap, jnp.float32(0.1)),
     )
-    # AT_target = 1.0 during daytime (circ_amp=0); elevated during Phase 2 sleep.
-    # sigma points all carry the same circ_amp so covariance propagates correctly.
-    AT_target = jnp.float32(1.0) + jnp.float32(params.circ_amp)
+    safe_ref         = jnp.maximum(jnp.float32(params.RMSSD_ref_ms), jnp.float32(1.0))
+    chronic_fraction = jnp.maximum(RMSSD_load_7d / safe_ref, jnp.float32(0.05))
+    AT_target        = chronic_fraction + jnp.float32(params.circ_amp)
     dAT_dt = (
         jnp.float32(params.k_AT_rec) * (AT_target - Autonomic_Tone)
         - jnp.float32(params.k_AT_sup) * P_norm * Autonomic_Tone
